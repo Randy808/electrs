@@ -59,15 +59,15 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path, config: &Config, metrics: &Metrics) -> Self {
-        let txstore_db = DB::open(&path.join("txstore"), config, metrics);
+        let txstore_db = DB::open(&path.join("txstore"), config, metrics, "txstore_db");
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config, metrics);
+        let history_db = DB::open(&path.join("history"), config, metrics, "history_db");
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config, metrics);
+        let cache_db = DB::open(&path.join("cache"), config, metrics, "cache_db");
 
         let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
             let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");

@@ -85,7 +85,7 @@ pub enum DBFlush {
 }
 
 impl DB {
-    pub fn open(path: &Path, config: &Config, metrics: &Metrics) -> DB {
+    pub fn open(path: &Path, config: &Config, metrics: &Metrics, namespace: &str) -> DB {
         debug!("opening DB at {:?}", path);
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
@@ -105,7 +105,7 @@ impl DB {
 
         let db = DB {
             db: rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB"),
-            db_stats: RocksDbMetrics::new(&metrics)
+            db_stats: RocksDbMetrics::new(&metrics, &namespace)
         };
         db.verify_compatibility(config);
         db
