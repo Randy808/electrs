@@ -58,16 +58,16 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path, config: &Config) -> Self {
-        let txstore_db = DB::open(&path.join("txstore"), config);
+    pub fn open(path: &Path, config: &Config, metrics: &Metrics) -> Self {
+        let txstore_db = DB::open(&path.join("txstore"), config, metrics);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config);
+        let history_db = DB::open(&path.join("history"), config, metrics);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config);
+        let cache_db = DB::open(&path.join("cache"), config, metrics);
 
         let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
             let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
@@ -106,6 +106,12 @@ impl Store {
 
     pub fn done_initial_sync(&self) -> bool {
         self.txstore_db.get(b"t").is_some()
+    }
+
+    pub fn export_db_stats(&self, context: &str) {
+        self.txstore_db.update_from_db(&context);
+        self.history_db.update_from_db(&context);
+        self.cache_db.update_from_db(&context);
     }
 }
 
@@ -867,6 +873,7 @@ impl ChainQuery {
 
     pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self.start_timer("lookup_txos");
+        self.store.export_db_stats("lookup_txos");
         lookup_txos(&self.store.txstore_db, outpoints)
     }
 
