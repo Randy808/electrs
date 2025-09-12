@@ -1,12 +1,14 @@
 use prometheus::GaugeVec;
-use rocksdb;
+use rocksdb::{self, MultiThreaded};
 
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::new_index::db_metrics::RocksDbMetrics;
-use crate::util::{bincode, Bytes};
+use crate::util::{bincode, spawn_thread, Bytes};
 
 static DB_VERSION: u32 = 1;
 
@@ -74,8 +76,7 @@ impl<'a> Iterator for ReverseScanIterator<'a> {
 
 #[derive(Debug)]
 pub struct DB {
-    db: rocksdb::DB,
-    db_stats: RocksDbMetrics
+    db: rocksdb::DBWithThreadMode<MultiThreaded>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -104,8 +105,7 @@ impl DB {
         // block_opts.set_block_size(???);
 
         let db = DB {
-            db: rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB"),
-            db_stats: RocksDbMetrics::new(&metrics, &namespace)
+            db: rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB")
         };
         db.verify_compatibility(config);
         db
@@ -265,49 +265,55 @@ impl DB {
     }
 
     // Updated method that takes a context string
-    pub fn update_from_db(&self, context: &str) {
+    pub fn update_from_db(&self, context: &str, metrics: &Metrics, namespace: &str) {
+        let db_clone = self.db.clone();
+        let db_stats = RocksDbMetrics::new(&metrics, &namespace);
+
         // Helper closure to parse and set gauge values with context label
         let update_gauge = |gauge: &GaugeVec, property: &str| {
-            if let Ok(Some(value)) = self.db.property_value(property) {
+            if let Ok(Some(value)) = db_clone.property_value(property) {
                 if let Ok(v) = value.parse::<f64>() {
                     gauge.with_label_values(&[context]).set(v);
                 }
             }
         };
 
-        // Update all metrics
-        update_gauge(&self.db_stats.num_immutable_mem_table, "rocksdb.num-immutable-mem-table");
-        update_gauge(&self.db_stats.mem_table_flush_pending, "rocksdb.mem-table-flush-pending");
-        update_gauge(&self.db_stats.compaction_pending, "rocksdb.compaction-pending");
-        update_gauge(&self.db_stats.background_errors, "rocksdb.background-errors");
-        update_gauge(&self.db_stats.cur_size_active_mem_table, "rocksdb.cur-size-active-mem-table");
-        update_gauge(&self.db_stats.cur_size_all_mem_tables, "rocksdb.cur-size-all-mem-tables");
-        update_gauge(&self.db_stats.size_all_mem_tables, "rocksdb.size-all-mem-tables");
-        update_gauge(&self.db_stats.num_entries_active_mem_table, "rocksdb.num-entries-active-mem-table");
-        update_gauge(&self.db_stats.num_entries_imm_mem_tables, "rocksdb.num-entries-imm-mem-tables");
-        update_gauge(&self.db_stats.num_deletes_active_mem_table, "rocksdb.num-deletes-active-mem-table");
-        update_gauge(&self.db_stats.num_deletes_imm_mem_tables, "rocksdb.num-deletes-imm-mem-tables");
-        update_gauge(&self.db_stats.estimate_num_keys, "rocksdb.estimate-num-keys");
-        update_gauge(&self.db_stats.estimate_table_readers_mem, "rocksdb.estimate-table-readers-mem");
-        update_gauge(&self.db_stats.is_file_deletions_enabled, "rocksdb.is-file-deletions-enabled");
-        update_gauge(&self.db_stats.num_snapshots, "rocksdb.num-snapshots");
-        update_gauge(&self.db_stats.oldest_snapshot_time, "rocksdb.oldest-snapshot-time");
-        update_gauge(&self.db_stats.num_live_versions, "rocksdb.num-live-versions");
-        update_gauge(&self.db_stats.current_super_version_number, "rocksdb.current-super-version-number");
-        update_gauge(&self.db_stats.estimate_live_data_size, "rocksdb.estimate-live-data-size");
-        update_gauge(&self.db_stats.min_log_number_to_keep, "rocksdb.min-log-number-to-keep");
-        update_gauge(&self.db_stats.min_obsolete_sst_number_to_keep, "rocksdb.min-obsolete-sst-number-to-keep");
-        update_gauge(&self.db_stats.total_sst_files_size, "rocksdb.total-sst-files-size");
-        update_gauge(&self.db_stats.live_sst_files_size, "rocksdb.live-sst-files-size");
-        update_gauge(&self.db_stats.base_level, "rocksdb.base-level");
-        update_gauge(&self.db_stats.estimate_pending_compaction_bytes, "rocksdb.estimate-pending-compaction-bytes");
-        update_gauge(&self.db_stats.num_running_compactions, "rocksdb.num-running-compactions");
-        update_gauge(&self.db_stats.num_running_flushes, "rocksdb.num-running-flushes");
-        update_gauge(&self.db_stats.actual_delayed_write_rate, "rocksdb.actual-delayed-write-rate");
-        update_gauge(&self.db_stats.is_write_stopped, "rocksdb.is-write-stopped");
-        update_gauge(&self.db_stats.estimate_oldest_key_time, "rocksdb.estimate-oldest-key-time");
-        update_gauge(&self.db_stats.block_cache_capacity, "rocksdb.block-cache-capacity");
-        update_gauge(&self.db_stats.block_cache_usage, "rocksdb.block-cache-usage");
-        update_gauge(&self.db_stats.block_cache_pinned_usage, "rocksdb.block-cache-pinned-usage");
+        spawn_thread("db_stats_exporter", move || loop {
+            // Update all metrics
+            update_gauge(db_stats.num_immutable_mem_table, "rocksdb.num-immutable-mem-table");
+            update_gauge(db_stats.mem_table_flush_pending, "rocksdb.mem-table-flush-pending");
+            update_gauge(db_stats.compaction_pending, "rocksdb.compaction-pending");
+            update_gauge(db_stats.background_errors, "rocksdb.background-errors");
+            update_gauge(db_stats.cur_size_active_mem_table, "rocksdb.cur-size-active-mem-table");
+            update_gauge(db_stats.cur_size_all_mem_tables, "rocksdb.cur-size-all-mem-tables");
+            update_gauge(db_stats.size_all_mem_tables, "rocksdb.size-all-mem-tables");
+            update_gauge(db_stats.num_entries_active_mem_table, "rocksdb.num-entries-active-mem-table");
+            update_gauge(db_stats.num_entries_imm_mem_tables, "rocksdb.num-entries-imm-mem-tables");
+            update_gauge(db_stats.num_deletes_active_mem_table, "rocksdb.num-deletes-active-mem-table");
+            update_gauge(db_stats.num_deletes_imm_mem_tables, "rocksdb.num-deletes-imm-mem-tables");
+            update_gauge(db_stats.estimate_num_keys, "rocksdb.estimate-num-keys");
+            update_gauge(db_stats.estimate_table_readers_mem, "rocksdb.estimate-table-readers-mem");
+            update_gauge(db_stats.is_file_deletions_enabled, "rocksdb.is-file-deletions-enabled");
+            update_gauge(db_stats.num_snapshots, "rocksdb.num-snapshots");
+            update_gauge(db_stats.oldest_snapshot_time, "rocksdb.oldest-snapshot-time");
+            update_gauge(db_stats.num_live_versions, "rocksdb.num-live-versions");
+            update_gauge(db_stats.current_super_version_number, "rocksdb.current-super-version-number");
+            update_gauge(db_stats.estimate_live_data_size, "rocksdb.estimate-live-data-size");
+            update_gauge(db_stats.min_log_number_to_keep, "rocksdb.min-log-number-to-keep");
+            update_gauge(db_stats.min_obsolete_sst_number_to_keep, "rocksdb.min-obsolete-sst-number-to-keep");
+            update_gauge(db_stats.total_sst_files_size, "rocksdb.total-sst-files-size");
+            update_gauge(db_stats.live_sst_files_size, "rocksdb.live-sst-files-size");
+            update_gauge(db_stats.base_level, "rocksdb.base-level");
+            update_gauge(db_stats.estimate_pending_compaction_bytes, "rocksdb.estimate-pending-compaction-bytes");
+            update_gauge(db_stats.num_running_compactions, "rocksdb.num-running-compactions");
+            update_gauge(db_stats.num_running_flushes, "rocksdb.num-running-flushes");
+            update_gauge(db_stats.actual_delayed_write_rate, "rocksdb.actual-delayed-write-rate");
+            update_gauge(db_stats.is_write_stopped, "rocksdb.is-write-stopped");
+            update_gauge(db_stats.estimate_oldest_key_time, "rocksdb.estimate-oldest-key-time");
+            update_gauge(db_stats.block_cache_capacity, "rocksdb.block-cache-capacity");
+            update_gauge(db_stats.block_cache_usage, "rocksdb.block-cache-usage");
+            update_gauge(db_stats.block_cache_pinned_usage, "rocksdb.block-cache-pinned-usage");
+            thread::sleep(Duration::from_secs(5));
+        });
     }
 }
