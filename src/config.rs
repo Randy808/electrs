@@ -49,6 +49,24 @@ pub struct Config {
     /// however, this requires much more disk space.
     pub initial_sync_compaction: bool,
 
+    /// RocksDB block cache size in MB (per database)
+    /// Caches decompressed blocks in memory to avoid repeated decompression (CPU intensive)
+    /// Total memory usage = cache_size * 3_databases (txstore, history, cache)
+    /// Recommendation: Start with 1024MB for production (default 8MB is too small)
+    /// Higher values reduce CPU load from cache misses but use more RAM
+    pub db_block_cache_mb: usize,
+
+    /// RocksDB parallelism level (background compaction  flush threads)
+    /// Recommendation: Set to number of CPU cores for optimal performance
+    /// This configures max_background_jobs and thread pools automatically
+    pub db_parallelism: usize,
+
+    /// RocksDB write buffer size in MB (per database)
+    /// Each database uses this much RAM for in-memory writes before flushing to disk
+    /// Total RAM usage = write_buffer_size * max_write_buffer_number * 3_databases
+    /// Larger buffers = fewer flushes (less CPU) but more RAM usage
+    pub db_write_buffer_size_mb: usize,
+
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
@@ -216,6 +234,24 @@ impl Config {
                     .long("initial-sync-compaction")
                     .help("Perform compaction during initial sync (slower but less disk space required)")
             ).arg(
+                Arg::with_name("db_block_cache_mb")
+                    .long("db-block-cache-mb")
+                    .help("RocksDB block cache size in MB per database (default: 8)")
+                    .takes_value(true)
+                    .default_value("8")
+            ).arg(
+                Arg::with_name("db_parallelism")
+                    .long("db-parallelism")
+                    .help("RocksDB parallelism level. Set to number of CPU cores for optimal performance (default: 2)")
+                    .takes_value(true)
+                    .default_value("2")
+            ).arg(
+                Arg::with_name("db_write_buffer_size_mb")
+                    .long("db-write-buffer-size-mb")
+                    .help("RocksDB write buffer size in MB per database. RAM usage = size * max_write_buffers(2) * 3_databases (default: 256)")
+                    .takes_value(true)
+                    .default_value("256")
+             ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
                     .help("Optional zmq socket address of the bitcoind daemon")
@@ -452,6 +488,9 @@ impl Config {
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
             initial_sync_compaction: m.is_present("initial_sync_compaction"),
+            db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
+            db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
+            db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             zmq_addr,
 
             #[cfg(feature = "liquid")]
