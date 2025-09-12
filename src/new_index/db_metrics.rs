@@ -65,6 +65,7 @@ impl RocksDbMetrics {
         // Define the label for context/caller
         let labels = &["context"];
 
+        // TODO: Call '.namespace' on new metric opts
         Self {
             // Memory table metrics
             num_immutable_mem_table: metrics.gauge_vec(MetricOpts::new(
