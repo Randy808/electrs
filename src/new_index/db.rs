@@ -203,6 +203,8 @@ impl DB {
             DBFlush::Disable => false,
         };
         let mut opts = rocksdb::WriteOptions::new();
+
+        // This is where sync and disable_wal is set
         opts.set_sync(do_flush);
         opts.disable_wal(!do_flush);
         self.db.write_opt(batch, &opts).unwrap();

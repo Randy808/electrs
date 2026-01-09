@@ -152,27 +152,53 @@ impl Query {
 
     #[trace]
     pub fn lookup_tx_spends(&self, tx: &Transaction) -> Vec<Option<SpendingInput>> {
+        // Get the txid from the transaction
         let txid = tx.compute_txid();
+
+        // get the outpoints form tx
         let outpoints = tx
+            // Gets the outputs (plural)
             .output
+            // turns it into an iterable
             .iter()
+            // Calls enumerate which also gives the iteration count
             .enumerate()
+
+            // filter, while ignoring index for now, the txouts into what's spendable
             .filter(|(_, txout)| is_spendable(txout))
+            // Then maps the tx using the vout
             .map(|(vout, _)| OutPoint::new(txid, vout as u32))
+            // then collect the results as a set
             .collect::<BTreeSet<_>>();
 
+        //S
         // First fetch all confirmed spends using a MultiGet operation,
         // then fall back to the mempool for any outpoints not spent on-chain
+        //S_END
+
+        // We know all the outpoints were spendable, now we see if any were spent
         let mut chain_spends = self.chain.lookup_spends(outpoints);
+
+        // We get the mempool
         let mempool = self.mempool();
+
+        //We get the outputs
         tx.output
+            // We iterate through them
             .iter()
+            // We enumerate
             .enumerate()
+            // we map the vout and output
             .map(|(vout, txout)| {
+                // If the output is spendable
                 if is_spendable(txout) {
+                    // We create the outpoint again
                     let outpoint = OutPoint::new(txid, vout as u32);
+
                     chain_spends
+                         // Then we remove and return the outpoint from the chainspends
                         .remove(&outpoint)
+                        // And return the spend from the mempool if
                         .or_else(|| mempool.lookup_spend(&outpoint))
                 } else {
                     None

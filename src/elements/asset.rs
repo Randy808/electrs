@@ -509,6 +509,7 @@ where
 
     // save updated stats to cache
     if let Some(lastblock) = lastblock {
+        // RANDY_TODO: look up rows vs write_rows
         chain.store().cache_db().write_rows(
             vec![asset_cache_row(asset_id, &newstats, &lastblock)],
             DBFlush::Enable,

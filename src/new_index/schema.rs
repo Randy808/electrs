@@ -1181,6 +1181,8 @@ fn add_transaction(txid: Txid, tx: &Transaction, rows: &mut Vec<DBRow>, iconfig:
             rows.push(TxOutRow::new(&txid, txo_index, txo).into_row());
         }
 
+        //R
+        // This is where the db rows with 'a' prefix is used.
         if iconfig.address_search {
             if let Some(row) = addr_search_row(&txo.script_pubkey, iconfig.network) {
                 rows.push(row);
