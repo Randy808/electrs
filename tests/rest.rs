@@ -1,5 +1,5 @@
 use bitcoin::hex::FromHex;
-use bitcoind::bitcoincore_rpc::RpcApi;
+use bitcoind::bitcoincore_rpc::{RpcApi};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Read;
@@ -24,6 +24,34 @@ fn get_json(rest_addr: net::SocketAddr, path: &str) -> Result<Value> {
 
 fn get_plain(rest_addr: net::SocketAddr, path: &str) -> Result<String> {
     Ok(get(rest_addr, path)?.into_string()?)
+}
+
+#[test]
+fn test_rest_evicted_tx() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    //Send transaction
+    let addr1 = tester.newaddress()?;
+    let txid1 = tester.send(&addr1, ".00001 BTC".parse().unwrap())?;
+
+    // Bump the fee
+    let bumped_txid1_info: serde_json::Value = tester.call("bumpfee", &[txid1.to_string().into()])?;
+
+    // Sync the mempool
+    tester.sync()?;
+
+    // Make sure we can't find the replaced transaction
+    let res = get(rest_addr, &format!("/tx/{}", txid1));
+    let err_resp = res.unwrap_err().into_response().unwrap();
+    assert_eq!(err_resp.status(), 404);
+
+    println!("{:?}", &bumped_txid1_info["txid"]);
+
+    // Verify we can get the new replacement transaction
+    get_json(rest_addr, &format!("/tx/{}", bumped_txid1_info["txid"].as_str().unwrap()))?;
+
+    rest_handle.stop();
+    Ok(())
 }
 
 #[test]
