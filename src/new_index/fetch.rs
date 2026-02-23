@@ -16,7 +16,7 @@ use std::thread;
 
 use electrs_macros::trace;
 
-use crate::chain::{Block, BlockHash};
+use crate::chain::{Block, BlockHash, Txid};
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::util::{spawn_thread, HeaderEntry, SyncChannel};
@@ -45,6 +45,8 @@ pub struct BlockEntry {
     pub block: Block,
     pub entry: HeaderEntry,
     pub size: u32,
+    /// Pre-computed txids, must always correspond 1:1 with block.txdata
+    pub txids: Vec<Txid>,
 }
 
 type SizedBlock = (Block, u32);
@@ -106,10 +108,14 @@ fn bitcoind_fetcher(
                 let block_entries: Vec<BlockEntry> = blocks
                     .into_iter()
                     .zip(entries)
-                    .map(|(block, entry)| BlockEntry {
-                        entry: entry.clone(), // TODO: remove this clone()
-                        size: block.total_size() as u32,
-                        block,
+                    .map(|(block, entry)| {
+                        let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+                        BlockEntry {
+                            entry: entry.clone(), // TODO: remove this clone()
+                            size: block.total_size() as u32,
+                            txids,
+                            block,
+                        }
                     })
                     .collect();
                 assert_eq!(block_entries.len(), entries.len());
@@ -156,7 +162,10 @@ fn blkfiles_fetcher(
                         let blockhash = block.block_hash();
                         entry_map
                             .remove(&blockhash)
-                            .map(|entry| BlockEntry { block, entry, size })
+                            .map(|entry| {
+                                let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+                                BlockEntry { block, entry, size, txids }
+                            })
                             .or_else(|| {
                                 trace!("skipping block {}", blockhash);
                                 None
@@ -224,9 +233,14 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
     Fetcher::from(
         chan.into_receiver(),
         spawn_thread("blkfiles_parser", move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(0) // CPU-bound
+                .thread_name(|i| format!("parse-blocks-{}", i))
+                .build()
+                .unwrap();
             blobs.map(|blob| {
                 trace!("parsing {} bytes", blob.len());
-                let blocks = parse_blocks(blob, magic).expect("failed to parse blk*.dat file");
+                let blocks = parse_blocks(&pool, blob, magic).expect("failed to parse blk*.dat file");
                 sender
                     .send(blocks)
                     .expect("failed to send blocks from blk*.dat file");
@@ -236,7 +250,7 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
 }
 
 #[trace]
-fn parse_blocks(blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
+fn parse_blocks(pool: &rayon::ThreadPool, blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
     let mut cursor = Cursor::new(&blob);
     let mut slices = vec![];
     let max_pos = blob.len() as u64;
@@ -273,11 +287,6 @@ fn parse_blocks(blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
         cursor.set_position(end as u64);
     }
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(0) // CPU-bound
-        .thread_name(|i| format!("parse-blocks-{}", i))
-        .build()
-        .unwrap();
     Ok(pool.install(|| {
         slices
             .into_par_iter()
