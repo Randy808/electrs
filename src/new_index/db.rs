@@ -121,7 +121,21 @@ impl DB {
         // Configure write buffer size (not set by increase_parallelism)
         db_opts.set_write_buffer_size(config.db_write_buffer_size_mb * 1024 * 1024);
 
-        db_opts.set_compaction_readahead_size(1 << 20);
+        // Allow up to 6 write buffers in memory. With the default of 2, a write can stall
+        // as soon as the active memtable fills and the previous one hasn't flushed yet.
+        // 6 buffers gives flush I/O more headroom before writes stall, which matters
+        // during initial sync where flushes are frequent.
+        db_opts.set_max_write_buffer_number(6);
+
+        // Merge 2 write buffers into one L0 file instead of flushing each separately.
+        // Halves the L0 file count, which reduces compaction work and iterator overhead
+        // during both initial sync and the final full_compaction.
+        db_opts.set_min_write_buffer_number_to_merge(2);
+
+        // 4 MiB readahead for compaction I/O (required to be >0 when direct I/O is on).
+        // Larger than the previous 1 MiB to better amortise syscall overhead when
+        // reading the many L0 files accumulated during initial sync.
+        db_opts.set_compaction_readahead_size(4 << 20);
 
         // Background-sync SST files to the OS incrementally as they are written,
         // rather than doing a large fsync on close. Smooths out I/O latency spikes.
