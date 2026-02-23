@@ -158,17 +158,18 @@ impl DB {
         let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
         block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_size_bytes));
 
-        // Full bloom filter (block_based=false): one filter per SST file covering all keys,
-        // vs the legacy per-block variant. At 10 bits/key the false-positive rate is ~1%.
-        // This eliminates almost all unnecessary disk reads in lookup_txos() for outputs
-        // that are not present in a given SST (i.e. ancient UTXOs spent much later).
-        block_opts.set_bloom_filter(10.0, false);
+        // All key types across all three databases (txstore, history, cache)
+        // share a 1-byte type code + 32-byte hash as the first 33 bytes of
+        // their key. Setting a fixed-prefix extractor enables per-SST prefix
+        // bloom filters so range scans (wallet sync) can skip files that do
+        // not contain the target scripthash.
+        db_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));
 
-        // Keep index and filter blocks in the block cache rather than pinned in heap memory
-        // (table_readers_mem). This bounds their memory usage and avoids extra I/Os to
-        // fetch them. Pinning L0 blocks ensures the hottest files never get evicted.
-        block_opts.set_cache_index_and_filter_blocks(true);
-        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        // Prefix bloom filter: one filter per SST file covering the 33-byte key prefix.
+        // At 10 bits/key the false-positive rate is ~1%. Eliminates almost all unnecessary
+        // disk reads in lookup_txos() for ancient UTXOs, and lets history scans skip SST
+        // files that don't contain the target scripthash prefix.
+        block_opts.set_bloom_filter(10.0, false);
 
         db_opts.set_block_based_table_factory(&block_opts);
 
@@ -182,10 +183,15 @@ impl DB {
     }
 
     pub fn full_compaction(&self) {
-        // TODO: make sure this doesn't fail silently
+        // Force rewrite of bottommost level to ensure bloom filters are
+        // applied to all SST files, not just upper levels.
         info!("starting full compaction on {:?}", self.db);
-        self.db.compact_range(None::<&[u8]>, None::<&[u8]>);
-        info!("finished full compaction on {:?}", self.db);
+        let start = std::time::Instant::now();
+        let mut opts = rocksdb::CompactOptions::default();
+        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        self.db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &opts);
+        let elapsed = start.elapsed();
+        info!("finished full compaction on {:?} in elapsed='{:.1?}'", self.db, elapsed);
     }
 
     pub fn enable_auto_compaction(&self) {
@@ -194,19 +200,34 @@ impl DB {
     }
 
     pub fn raw_iterator(&self) -> rocksdb::DBRawIterator {
-        self.db.raw_iterator()
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        self.db.raw_iterator_opt(opts)
     }
 
     pub fn iter_scan(&self, prefix: &[u8]) -> ScanIterator {
+        // When a prefix extractor is configured (fixed 33-byte prefix), scans
+        // with shorter prefixes must use total-order seek to avoid incorrectly
+        // skipping SST files whose keys are outside the prefix extractor domain.
+        let iter = if prefix.len() >= 33 {
+            self.db.prefix_iterator(prefix)
+        } else {
+            let mut opts = rocksdb::ReadOptions::default();
+            opts.set_total_order_seek(true);
+            self.db.iterator_opt(
+                rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+                opts,
+            )
+        };
         ScanIterator {
             prefix: prefix.to_vec(),
-            iter: self.db.prefix_iterator(prefix),
+            iter,
             done: false,
         }
     }
 
     pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator {
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+        let iter = self.db.full_iterator(rocksdb::IteratorMode::From(
             start_at,
             rocksdb::Direction::Forward,
         ));
@@ -218,7 +239,9 @@ impl DB {
     }
 
     pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator {
-        let mut iter = self.db.raw_iterator();
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        let mut iter = self.db.raw_iterator_opt(opts);
         iter.seek_for_prev(prefix_max);
 
         ReverseScanIterator {
