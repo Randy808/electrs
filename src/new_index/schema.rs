@@ -251,15 +251,6 @@ impl Indexer {
     }
 
     fn headers_to_add(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
-        let added_blockhashes = self.store.added_blockhashes.read().unwrap();
-        new_headers
-            .iter()
-            .filter(|e| !added_blockhashes.contains(e.hash()))
-            .cloned()
-            .collect()
-    }
-
-    fn headers_to_index(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
         let indexed_blockhashes = self.store.indexed_blockhashes.read().unwrap();
         new_headers
             .iter()
@@ -357,19 +348,11 @@ impl Indexer {
                 fetcher_count += 1;
                 blocks_fetched += blocks.len();
 
-                self.add(&blocks)
+                self.add(&blocks);
+                self.index(&blocks);
             });
 
         self.start_auto_compactions(&self.store.txstore_db);
-
-        // Index new blocks to the history db
-        let to_index = self.headers_to_index(&new_headers);
-        debug!(
-            "indexing history from {} blocks using {:?}",
-            to_index.len(),
-            self.from
-        );
-        start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
         self.start_auto_compactions(&self.store.history_db);
         self.start_auto_compactions(&self.store.cache_db);
 
