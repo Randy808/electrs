@@ -133,10 +133,29 @@ impl DB {
         // compaction_readahead_size (set above) is required when using direct I/O.
         db_opts.set_use_direct_io_for_flush_and_compaction(true);
 
-        // Configure block cache and bloom filters
+        // Parallelize sub-ranges within a single compaction job (including the one-time
+        // full_compaction at the end of initial sync). Without this, compact_range() is
+        // single-threaded regardless of increase_parallelism(). Setting it equal to the
+        // parallelism level keeps all background threads busy during the final compaction.
+        db_opts.set_max_subcompactions(parallelism as u32);
+
+        // Configure block cache and table options
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
         block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_size_bytes));
+
+        // Full bloom filter (block_based=false): one filter per SST file covering all keys,
+        // vs the legacy per-block variant. At 10 bits/key the false-positive rate is ~1%.
+        // This eliminates almost all unnecessary disk reads in lookup_txos() for outputs
+        // that are not present in a given SST (i.e. ancient UTXOs spent much later).
+        block_opts.set_bloom_filter(10.0, false);
+
+        // Keep index and filter blocks in the block cache rather than pinned in heap memory
+        // (table_readers_mem). This bounds their memory usage and avoids extra I/Os to
+        // fetch them. Pinning L0 blocks ensures the hottest files never get evicted.
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+
         db_opts.set_block_based_table_factory(&block_opts);
 
         let db = DB {
