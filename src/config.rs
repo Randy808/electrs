@@ -67,6 +67,12 @@ pub struct Config {
     /// Larger buffers = fewer flushes (less CPU) but more RAM usage
     pub db_write_buffer_size_mb: usize,
 
+    /// Number of RocksDB partitions per logical database (txstore, history, cache).
+    /// N=1 (default) is fully backward-compatible with existing on-disk data.
+    /// N>1 splits each database into N separate RocksDB instances by routing rows
+    /// based on the first 2 bytes of the hash field in each key.
+    pub db_partition_count: usize,
+
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
@@ -252,6 +258,12 @@ impl Config {
                     .takes_value(true)
                     .default_value("256")
              ).arg(
+                Arg::with_name("db_partition_count")
+                    .long("db-partition-count")
+                    .help("Number of RocksDB partitions per logical database (txstore, history, cache). N=1 is backward-compatible with existing data.")
+                    .takes_value(true)
+                    .default_value("1")
+            ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
                     .help("Optional zmq socket address of the bitcoind daemon")
@@ -491,6 +503,7 @@ impl Config {
             db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
+            db_partition_count: value_t_or_exit!(m, "db_partition_count", usize),
             zmq_addr,
 
             #[cfg(feature = "liquid")]
@@ -505,6 +518,10 @@ impl Config {
             #[cfg(feature = "electrum-discovery")]
             tor_proxy: m.value_of("tor_proxy").map(|s| s.parse().unwrap()),
         };
+        assert!(
+            config.db_partition_count >= 1,
+            "db-partition-count must be >= 1"
+        );
         eprintln!("{:?}", config);
         config
     }

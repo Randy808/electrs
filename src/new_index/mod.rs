@@ -7,7 +7,7 @@ mod query;
 pub mod schema;
 pub mod zmq;
 
-pub use self::db::{DBRow, DB};
+pub use self::db::{DBRow, PartitionedDB, DB};
 pub use self::fetch::{BlockEntry, FetchFrom};
 pub use self::mempool::Mempool;
 pub use self::query::Query;

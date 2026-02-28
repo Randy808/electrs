@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::new_index::db_metrics::RocksDbMetrics;
 use crate::util::{bincode, spawn_thread, Bytes};
 
+
 static DB_VERSION: u32 = 2;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -254,6 +255,7 @@ impl DB {
     }
 
     pub fn start_stats_exporter(&self, db_metrics: Arc<RocksDbMetrics>, db_name: &str) {
+
         let db_arc = Arc::clone(&self.db);
         let label = db_name.to_string();
 
@@ -301,5 +303,259 @@ impl DB {
             update_gauge(&db_metrics.block_cache_pinned_usage, "rocksdb.block-cache-pinned-usage");
             thread::sleep(Duration::from_secs(5));
         });
+    }
+}
+
+/// A set of RocksDB instances that together implement one logical database.
+///
+/// With `partition_count == 1` the behavior is identical to a single `DB`, and
+/// the on-disk path names are unchanged (backward-compatible).  With
+/// `partition_count > 1` rows are routed to partition `i` based on bytes 1–2
+/// of the key (the first two bytes of the hash field that follows the 1-byte
+/// type prefix).
+pub struct PartitionedDB {
+    partitions: Vec<DB>,
+    partition_count: usize,
+}
+
+impl PartitionedDB {
+    /// Open (or create) the partitioned database.
+    ///
+    /// * `base_path` – directory that contains all sub-databases
+    ///   (e.g. `<db_path>/newindex/`)
+    /// * `name` – logical name used for path construction (`"txstore"`,
+    ///   `"history"`, or `"cache"`)
+    /// * `verify_compat` – passed straight through to `DB::open`
+    pub fn open(base_path: &Path, name: &str, config: &Config, verify_compat: bool) -> PartitionedDB {
+        let n = config.db_partition_count;
+        let partitions: Vec<DB> = if n == 1 {
+            vec![DB::open(&base_path.join(name), config, verify_compat)]
+        } else {
+            (0..n)
+                .map(|i| DB::open(&base_path.join(format!("{}_{}", name, i)), config, verify_compat))
+                .collect()
+        };
+        let pdb = PartitionedDB { partitions, partition_count: n };
+
+        // Write or verify partition metadata in each partition DB so that we
+        // detect accidental re-opens with a different partition count.
+        for (i, db) in pdb.partitions.iter().enumerate() {
+            let encoded = bincode::serialize_little(&(n as u64, i as u64)).unwrap();
+            match db.get(b"partition_config") {
+                None => db.put(b"partition_config", &encoded),
+                Some(existing) if existing != encoded => panic!(
+                    "Partition config mismatch at {}[{}]: \
+                     expected (count={}, index={}) but found existing metadata. \
+                     Cannot open a database with a different partition count.",
+                    name, i, n, i
+                ),
+                Some(_) => {}
+            }
+        }
+
+        pdb
+    }
+
+    /// Determine which partition owns `key`.
+    ///
+    /// Global / metadata keys are 1 byte long, so they always land in
+    /// partition 0.  Data keys follow the layout `[1-byte prefix][32-byte hash]…`,
+    /// so bytes 1–2 carry uniform entropy that is used for routing.
+    fn partition_for(&self, key: &[u8]) -> usize {
+        if self.partition_count == 1 || key.len() < 3 {
+            return 0;
+        }
+        let prefix = u16::from_be_bytes([key[1], key[2]]);
+        (prefix as usize) * self.partition_count / 65536
+    }
+
+    // ── Point operations ─────────────────────────────────────────────────────
+
+    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+        self.partitions[self.partition_for(key)].get(key)
+    }
+
+    pub fn put(&self, key: &[u8], value: &[u8]) {
+        self.partitions[self.partition_for(key)].put(key, value)
+    }
+
+    pub fn put_sync(&self, key: &[u8], value: &[u8]) {
+        self.partitions[self.partition_for(key)].put_sync(key, value)
+    }
+
+    pub fn flush(&self) {
+        for p in &self.partitions {
+            p.flush();
+        }
+    }
+
+    // ── Batch writes ──────────────────────────────────────────────────────────
+
+    pub fn write_rows(&self, rows: Vec<DBRow>, flush: DBFlush) {
+        if self.partition_count == 1 {
+            return self.partitions[0].write_rows(rows, flush);
+        }
+        let mut buckets: Vec<Vec<DBRow>> = (0..self.partition_count).map(|_| vec![]).collect();
+        for row in rows {
+            buckets[self.partition_for(&row.key)].push(row);
+        }
+        for (p, bucket) in buckets.into_iter().enumerate() {
+            if !bucket.is_empty() {
+                self.partitions[p].write_rows(bucket, flush);
+            }
+        }
+    }
+
+    pub fn delete_rows(&self, rows: Vec<DBRow>, flush: DBFlush) {
+        if self.partition_count == 1 {
+            return self.partitions[0].delete_rows(rows, flush);
+        }
+        let mut buckets: Vec<Vec<DBRow>> = (0..self.partition_count).map(|_| vec![]).collect();
+        for row in rows {
+            buckets[self.partition_for(&row.key)].push(row);
+        }
+        for (p, bucket) in buckets.into_iter().enumerate() {
+            if !bucket.is_empty() {
+                self.partitions[p].delete_rows(bucket, flush);
+            }
+        }
+    }
+
+    /// Compatibility shim for the migration binary, which builds a
+    /// `rocksdb::WriteBatch` directly.  Only valid with `partition_count == 1`
+    /// (migration always runs on a pre-partition database).
+    pub fn write_batch(&self, batch: rocksdb::WriteBatch, flush: DBFlush) {
+        assert_eq!(
+            self.partition_count, 1,
+            "write_batch is not supported with partition_count > 1"
+        );
+        self.partitions[0].write_batch(batch, flush)
+    }
+
+    /// Raw iterator over partition 0.  Only valid with `partition_count == 1`;
+    /// used by diagnostic utility binaries that do full linear key scans.
+    pub fn raw_iterator(&self) -> rocksdb::DBRawIterator<'_> {
+        assert_eq!(
+            self.partition_count, 1,
+            "raw_iterator is not supported with partition_count > 1"
+        );
+        self.partitions[0].raw_iterator()
+    }
+
+    /// Delete a key range in every partition.
+    ///
+    /// Applying a range delete to all partitions is always safe — it is a
+    /// no-op for partitions that hold no matching rows.
+    pub fn delete_range<K: AsRef<[u8]>>(&self, from: K, to: K, flush: DBFlush) {
+        for db in &self.partitions {
+            db.delete_range(from.as_ref(), to.as_ref(), flush);
+        }
+    }
+
+    // ── Scan iterators ────────────────────────────────────────────────────────
+
+    /// Scan all rows whose key starts with `prefix`.
+    ///
+    /// * prefix ≥ 3 bytes → single-partition dispatch (fast path; all
+    ///   performance-critical history scans use a 33-byte prefix).
+    /// * prefix < 3 bytes → fan-out across all partitions and collect.
+    ///   Callers with short prefixes (startup block-hash loads, migration
+    ///   binary) always `.collect()` the result, so collecting eagerly here is
+    ///   acceptable.
+    pub fn iter_scan(&self, prefix: &[u8]) -> Box<dyn Iterator<Item = DBRow> + '_> {
+        if self.partition_count == 1 || prefix.len() >= 3 {
+            let p = self.partition_for(prefix);
+            return Box::new(self.partitions[p].iter_scan(prefix));
+        }
+        // Fan-out: collect results from all partitions.
+        let rows: Vec<DBRow> = self
+            .partitions
+            .iter()
+            .flat_map(|db| db.iter_scan(prefix))
+            .collect();
+        Box::new(rows.into_iter())
+    }
+
+    /// Scan starting at `start_at`, yielding rows whose key begins with
+    /// `prefix`.  Always dispatched to the single partition that owns
+    /// `prefix` (callers always use ≥ 33-byte prefixes).
+    pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator<'_> {
+        self.partitions[self.partition_for(prefix)].iter_scan_from(prefix, start_at)
+    }
+
+    /// Reverse scan ending at `prefix_max`, yielding rows whose key begins
+    /// with `prefix`.  Always dispatched to the single partition that owns
+    /// `prefix` (callers always use ≥ 33-byte prefixes).
+    pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator<'_> {
+        self.partitions[self.partition_for(prefix)].iter_scan_reverse(prefix, prefix_max)
+    }
+
+    // ── Multi-get ─────────────────────────────────────────────────────────────
+
+    /// Multi-get that transparently fans out across partitions and
+    /// reassembles results in the original key order.
+    pub fn multi_get<K, I>(&self, keys: I) -> Vec<Result<Option<Vec<u8>>, rocksdb::Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        if self.partition_count == 1 {
+            return self.partitions[0].multi_get(keys);
+        }
+
+        let keys: Vec<K> = keys.into_iter().collect();
+
+        // Group (original_index, key_bytes) by partition.
+        let mut per_partition: Vec<Vec<(usize, &[u8])>> =
+            (0..self.partition_count).map(|_| vec![]).collect();
+        for (idx, k) in keys.iter().enumerate() {
+            per_partition[self.partition_for(k.as_ref())].push((idx, k.as_ref()));
+        }
+
+        // Placeholder vec to reassemble results in original order.
+        let mut results: Vec<Option<Result<Option<Vec<u8>>, rocksdb::Error>>> =
+            (0..keys.len()).map(|_| None).collect();
+
+        for (p, group) in per_partition.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let orig_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+            let group_keys: Vec<&[u8]> = group.iter().map(|(_, k)| *k).collect();
+            for (res, orig_idx) in self.partitions[p]
+                .multi_get(group_keys)
+                .into_iter()
+                .zip(orig_indices)
+            {
+                results[orig_idx] = Some(res);
+            }
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    // ── Maintenance ───────────────────────────────────────────────────────────
+
+    pub fn full_compaction(&self) {
+        for p in &self.partitions {
+            p.full_compaction();
+        }
+    }
+
+    pub fn enable_auto_compaction(&self) {
+        for p in &self.partitions {
+            p.enable_auto_compaction();
+        }
+    }
+
+    pub fn start_stats_exporter(&self, db_metrics: Arc<RocksDbMetrics>, db_name: &str) {
+        for (i, p) in self.partitions.iter().enumerate() {
+            let label = if self.partition_count == 1 {
+                db_name.to_string()
+            } else {
+                format!("{}_{}", db_name, i)
+            };
+            p.start_stats_exporter(Arc::clone(&db_metrics), &label);
+        }
     }
 }

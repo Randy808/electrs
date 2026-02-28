@@ -33,7 +33,7 @@ use crate::util::{
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
 };
 
-use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
+use crate::new_index::db::{DBFlush, DBRow, PartitionedDB, ReverseScanIterator, ScanIterator};
 use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 
 #[cfg(feature = "liquid")]
@@ -49,9 +49,9 @@ const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
 pub struct Store {
     // TODO: should be column families
-    txstore_db: DB,
-    history_db: DB,
-    cache_db: DB,
+    txstore_db: PartitionedDB,
+    history_db: PartitionedDB,
+    cache_db: PartitionedDB,
     added_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_headers: RwLock<HeaderList>,
@@ -61,15 +61,15 @@ impl Store {
     pub fn open(config: &Config, metrics: &Metrics, verify_compat: bool) -> Self {
         let path = config.db_path.join("newindex");
 
-        let txstore_db = DB::open(&path.join("txstore"), config, verify_compat);
+        let txstore_db = PartitionedDB::open(&path, "txstore", config, verify_compat);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config, verify_compat);
+        let history_db = PartitionedDB::open(&path, "history", config, verify_compat);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config, verify_compat);
+        let cache_db = PartitionedDB::open(&path, "cache", config, verify_compat);
 
         let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
         txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
@@ -112,15 +112,15 @@ impl Store {
         }
     }
 
-    pub fn txstore_db(&self) -> &DB {
+    pub fn txstore_db(&self) -> &PartitionedDB {
         &self.txstore_db
     }
 
-    pub fn history_db(&self) -> &DB {
+    pub fn history_db(&self) -> &PartitionedDB {
         &self.history_db
     }
 
-    pub fn cache_db(&self) -> &DB {
+    pub fn cache_db(&self) -> &PartitionedDB {
         &self.cache_db
     }
 
@@ -268,7 +268,7 @@ impl Indexer {
             .collect()
     }
 
-    fn start_auto_compactions(&self, db: &DB) {
+    fn start_auto_compactions(&self, db: &PartitionedDB) {
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
             db.full_compaction();
@@ -1143,14 +1143,14 @@ impl ChainQuery {
     }
 }
 
-fn load_blockhashes(db: &DB, prefix: &[u8]) -> HashSet<BlockHash> {
+fn load_blockhashes(db: &PartitionedDB, prefix: &[u8]) -> HashSet<BlockHash> {
     db.iter_scan(prefix)
         .map(BlockRow::from_row)
         .map(|r| deserialize(&r.key.hash).expect("failed to parse BlockHash"))
         .collect()
 }
 
-fn load_blockheaders(db: &DB) -> HashMap<BlockHash, BlockHeader> {
+fn load_blockheaders(db: &PartitionedDB) -> HashMap<BlockHash, BlockHeader> {
     db.iter_scan(&BlockRow::header_filter())
         .map(BlockRow::from_row)
         .map(|r| {
@@ -1224,7 +1224,7 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
         .collect()
 }
 
-fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+fn lookup_txos(txstore_db: &PartitionedDB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
     let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
     txstore_db
         .multi_get(keys)
@@ -1239,14 +1239,14 @@ fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap
         .collect()
 }
 
-fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
+fn lookup_txo(txstore_db: &PartitionedDB, outpoint: &OutPoint) -> Option<TxOut> {
     txstore_db
         .get(&TxOutRow::key(&outpoint))
         .map(|val| deserialize(&val).expect("failed to parse TxOut"))
 }
 
 pub fn lookup_confirmations(
-    history_db: &DB,
+    history_db: &PartitionedDB,
     tip_height: u32,
     txids: BTreeSet<Txid>,
 ) -> HashMap<Txid, u32> {
