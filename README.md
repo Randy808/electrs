@@ -70,6 +70,7 @@ In addition to electrs's original configuration options, a few new options are a
 - `--utxos-limit <num>` - maximum number of utxos to return per address.
 - `--electrum-txs-limit <num>` - maximum number of txs to return per address in the electrum server (does not apply for the http api).
 - `--electrum-banner <text>` - welcome banner text for electrum server.
+- `--db-partition-count <num>` - Specifies the number of db partitions  (default 1)
 
 Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.
