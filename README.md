@@ -71,6 +71,7 @@ In addition to electrs's original configuration options, a few new options are a
 - `--electrum-txs-limit <num>` - maximum number of txs to return per address in the electrum server (does not apply for the http api).
 - `--electrum-banner <text>` - welcome banner text for electrum server.
 - `--db-partition-count <num>` - Specifies the number of db partitions  (default 1)
+- `--db-partition-range <lo-hi>` - Inclusive range of partition indices this node maintains (e.g. `0-499` out of 1000). Omit to maintain all partitions. API queries for hashes outside the range return HTTP 400.
 
 Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.

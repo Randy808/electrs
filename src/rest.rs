@@ -15,7 +15,7 @@ use crate::util::{
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode;
 
-use bitcoin::hashes::FromSliceError as HashError;
+use bitcoin::hashes::{FromSliceError as HashError, Hash};
 use bitcoin::hex::{self, DisplayHex, FromHex, HexToBytesIter};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Response, Server, StatusCode};
@@ -470,6 +470,14 @@ impl Default for SpendingValue {
     }
 }
 
+fn check_partition(config: &Config, hash_bytes: &[u8]) -> Result<(), HttpError> {
+    if config.is_hash_in_active_partition(hash_bytes) {
+        Ok(())
+    } else {
+        Err(HttpError::partition_not_supported())
+    }
+}
+
 fn ttl_by_depth(height: Option<usize>, query: &Query) -> u32 {
     height.map_or(TTL_SHORT, |height| {
         if query.chain().best_height() - height >= CONF_FINAL {
@@ -746,6 +754,7 @@ fn handle_request(
         (&Method::GET, Some(script_type @ &"address"), Some(script_str), None, None, None)
         | (&Method::GET, Some(script_type @ &"scripthash"), Some(script_str), None, None, None) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            check_partition(config, &script_hash)?;
             let stats = query.stats(&script_hash[..]);
             json_response(
                 json!({
@@ -773,6 +782,7 @@ fn handle_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            check_partition(config, &script_hash)?;
 
             let mut txs = vec![];
 
@@ -812,6 +822,7 @@ fn handle_request(
             last_seen_txid,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            check_partition(config, &script_hash)?;
             let last_seen_txid = last_seen_txid.and_then(|txid| Txid::from_str(txid).ok());
 
             let txs = query
@@ -844,6 +855,7 @@ fn handle_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            check_partition(config, &script_hash)?;
 
             let txs = query
                 .mempool()
@@ -872,6 +884,7 @@ fn handle_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            check_partition(config, &script_hash)?;
             let utxos: Vec<UtxoValue> = query
                 .utxo(&script_hash[..])?
                 .into_iter()
@@ -889,6 +902,7 @@ fn handle_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), None, None, None) => {
             let hash = Txid::from_str(hash)?;
+            check_partition(config, hash.as_byte_array())?;
             let tx = query
                 .lookup_txn(&hash)
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
@@ -902,6 +916,7 @@ fn handle_request(
         (&Method::GET, Some(&"tx"), Some(hash), Some(out_type @ &"hex"), None, None)
         | (&Method::GET, Some(&"tx"), Some(hash), Some(out_type @ &"raw"), None, None) => {
             let hash = Txid::from_str(hash)?;
+            check_partition(config, hash.as_byte_array())?;
             let rawtx = query
                 .lookup_raw_txn(&hash)
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
@@ -922,6 +937,7 @@ fn handle_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"status"), None, None) => {
             let hash = Txid::from_str(hash)?;
+            check_partition(config, hash.as_byte_array())?;
             let status = query.get_tx_status(&hash);
             let ttl = ttl_by_depth(status.block_height, query);
             json_response(status, ttl)
@@ -929,6 +945,7 @@ fn handle_request(
 
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"merkle-proof"), None, None) => {
             let hash = Txid::from_str(hash)?;
+            check_partition(config, hash.as_byte_array())?;
             let blockid = query.chain().tx_confirming_block(&hash).ok_or_else(|| {
                 HttpError::not_found("Transaction not found or is unconfirmed".to_string())
             })?;
@@ -944,6 +961,7 @@ fn handle_request(
         #[cfg(not(feature = "liquid"))]
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"merkleblock-proof"), None, None) => {
             let hash = Txid::from_str(hash)?;
+            check_partition(config, hash.as_byte_array())?;
 
             let merkleblock = query.chain().get_merkleblock_proof(&hash).ok_or_else(|| {
                 HttpError::not_found("Transaction not found or is unconfirmed".to_string())
@@ -961,6 +979,7 @@ fn handle_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"outspend"), Some(index), None) => {
             let hash = Txid::from_str(hash)?;
+            check_partition(config, hash.as_byte_array())?;
             let outpoint = OutPoint {
                 txid: hash,
                 vout: index.parse::<u32>()?,
@@ -979,6 +998,7 @@ fn handle_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"outspends"), None, None) => {
             let hash = Txid::from_str(hash)?;
+            check_partition(config, hash.as_byte_array())?;
             let tx = query
                 .lookup_txn(&hash)
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
@@ -1305,6 +1325,13 @@ struct HttpError(StatusCode, String);
 impl HttpError {
     fn not_found(msg: String) -> Self {
         HttpError(StatusCode::NOT_FOUND, msg)
+    }
+
+    fn partition_not_supported() -> Self {
+        HttpError(
+            StatusCode::BAD_REQUEST,
+            "Query falls outside the maintained partition range".to_string(),
+        )
     }
 }
 

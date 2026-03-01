@@ -1,6 +1,7 @@
 use prometheus::GaugeVec;
 use rocksdb;
 
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::path::Path;
 use std::sync::Arc;
@@ -313,8 +314,12 @@ impl DB {
 /// `partition_count > 1` rows are routed to partition `i` based on bytes 1–2
 /// of the key (the first two bytes of the hash field that follows the 1-byte
 /// type prefix).
+///
+/// Only the partitions in `active_range` (inclusive) are opened.  Writes for
+/// out-of-range partitions are silently dropped; reads return `None`.
 pub struct PartitionedDB {
-    partitions: Vec<DB>,
+    /// Opened DB instances keyed by logical partition index.
+    active_partitions: HashMap<usize, DB>,
     partition_count: usize,
 }
 
@@ -328,18 +333,28 @@ impl PartitionedDB {
     /// * `verify_compat` – passed straight through to `DB::open`
     pub fn open(base_path: &Path, name: &str, config: &Config, verify_compat: bool) -> PartitionedDB {
         let n = config.db_partition_count;
-        let partitions: Vec<DB> = if n == 1 {
-            vec![DB::open(&base_path.join(name), config, verify_compat)]
+        let (lo, hi) = config.db_partition_range.unwrap_or((0, n - 1));
+
+        let active_partitions: HashMap<usize, DB> = if n == 1 {
+            [(0, DB::open(&base_path.join(name), config, verify_compat))].into()
         } else {
-            (0..n)
-                .map(|i| DB::open(&base_path.join(format!("{}_{}", name, i)), config, verify_compat))
+            (lo..=hi)
+                .map(|i| {
+                    let db = DB::open(
+                        &base_path.join(format!("{}_{}", name, i)),
+                        config,
+                        verify_compat,
+                    );
+                    (i, db)
+                })
                 .collect()
         };
-        let pdb = PartitionedDB { partitions, partition_count: n };
 
-        // Write or verify partition metadata in each partition DB so that we
-        // detect accidental re-opens with a different partition count.
-        for (i, db) in pdb.partitions.iter().enumerate() {
+        let pdb = PartitionedDB { active_partitions, partition_count: n };
+
+        // Write or verify partition metadata in each active partition DB so that
+        // we detect accidental re-opens with a different partition count.
+        for (&i, db) in &pdb.active_partitions {
             let encoded = bincode::serialize_little(&(n as u64, i as u64)).unwrap();
             match db.get(b"partition_config") {
                 None => db.put(b"partition_config", &encoded),
@@ -356,9 +371,9 @@ impl PartitionedDB {
         pdb
     }
 
-    /// Determine which partition owns `key`.
+    /// Determine which logical partition index owns `key`.
     ///
-    /// Global / metadata keys are 1 byte long, so they always land in
+    /// Global / metadata keys are short (< 3 bytes), so they always land in
     /// partition 0.  Data keys follow the layout `[1-byte prefix][32-byte hash]…`,
     /// so bytes 1–2 carry uniform entropy that is used for routing.
     fn partition_for(&self, key: &[u8]) -> usize {
@@ -369,23 +384,34 @@ impl PartitionedDB {
         (prefix as usize) * self.partition_count / 65536
     }
 
+    fn is_partition_active(&self, idx: usize) -> bool {
+        self.active_partitions.contains_key(&idx)
+    }
+
     // ── Point operations ─────────────────────────────────────────────────────
 
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
-        self.partitions[self.partition_for(key)].get(key)
+        let p = self.partition_for(key);
+        self.active_partitions.get(&p)?.get(key)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        self.partitions[self.partition_for(key)].put(key, value)
+        let p = self.partition_for(key);
+        if let Some(db) = self.active_partitions.get(&p) {
+            db.put(key, value);
+        }
     }
 
     pub fn put_sync(&self, key: &[u8], value: &[u8]) {
-        self.partitions[self.partition_for(key)].put_sync(key, value)
+        let p = self.partition_for(key);
+        if let Some(db) = self.active_partitions.get(&p) {
+            db.put_sync(key, value);
+        }
     }
 
     pub fn flush(&self) {
-        for p in &self.partitions {
-            p.flush();
+        for db in self.active_partitions.values() {
+            db.flush();
         }
     }
 
@@ -393,31 +419,35 @@ impl PartitionedDB {
 
     pub fn write_rows(&self, rows: Vec<DBRow>, flush: DBFlush) {
         if self.partition_count == 1 {
-            return self.partitions[0].write_rows(rows, flush);
+            // N=1: fast path — only one partition, always active.
+            return self.active_partitions[&0].write_rows(rows, flush);
         }
-        let mut buckets: Vec<Vec<DBRow>> = (0..self.partition_count).map(|_| vec![]).collect();
+        let mut buckets: HashMap<usize, Vec<DBRow>> = HashMap::new();
         for row in rows {
-            buckets[self.partition_for(&row.key)].push(row);
-        }
-        for (p, bucket) in buckets.into_iter().enumerate() {
-            if !bucket.is_empty() {
-                self.partitions[p].write_rows(bucket, flush);
+            let p = self.partition_for(&row.key);
+            if self.is_partition_active(p) {
+                buckets.entry(p).or_default().push(row);
             }
+            // Rows for inactive partitions are silently dropped.
+        }
+        for (p, bucket) in buckets {
+            self.active_partitions[&p].write_rows(bucket, flush);
         }
     }
 
     pub fn delete_rows(&self, rows: Vec<DBRow>, flush: DBFlush) {
         if self.partition_count == 1 {
-            return self.partitions[0].delete_rows(rows, flush);
+            return self.active_partitions[&0].delete_rows(rows, flush);
         }
-        let mut buckets: Vec<Vec<DBRow>> = (0..self.partition_count).map(|_| vec![]).collect();
+        let mut buckets: HashMap<usize, Vec<DBRow>> = HashMap::new();
         for row in rows {
-            buckets[self.partition_for(&row.key)].push(row);
-        }
-        for (p, bucket) in buckets.into_iter().enumerate() {
-            if !bucket.is_empty() {
-                self.partitions[p].delete_rows(bucket, flush);
+            let p = self.partition_for(&row.key);
+            if self.is_partition_active(p) {
+                buckets.entry(p).or_default().push(row);
             }
+        }
+        for (p, bucket) in buckets {
+            self.active_partitions[&p].delete_rows(bucket, flush);
         }
     }
 
@@ -429,7 +459,7 @@ impl PartitionedDB {
             self.partition_count, 1,
             "write_batch is not supported with partition_count > 1"
         );
-        self.partitions[0].write_batch(batch, flush)
+        self.active_partitions[&0].write_batch(batch, flush)
     }
 
     /// Raw iterator over partition 0.  Only valid with `partition_count == 1`;
@@ -439,15 +469,15 @@ impl PartitionedDB {
             self.partition_count, 1,
             "raw_iterator is not supported with partition_count > 1"
         );
-        self.partitions[0].raw_iterator()
+        self.active_partitions[&0].raw_iterator()
     }
 
-    /// Delete a key range in every partition.
+    /// Delete a key range in every active partition.
     ///
-    /// Applying a range delete to all partitions is always safe — it is a
+    /// Applying a range delete to all active partitions is safe — it is a
     /// no-op for partitions that hold no matching rows.
     pub fn delete_range<K: AsRef<[u8]>>(&self, from: K, to: K, flush: DBFlush) {
-        for db in &self.partitions {
+        for db in self.active_partitions.values() {
             db.delete_range(from.as_ref(), to.as_ref(), flush);
         }
     }
@@ -458,19 +488,22 @@ impl PartitionedDB {
     ///
     /// * prefix ≥ 3 bytes → single-partition dispatch (fast path; all
     ///   performance-critical history scans use a 33-byte prefix).
-    /// * prefix < 3 bytes → fan-out across all partitions and collect.
+    /// * prefix < 3 bytes → fan-out across all active partitions and collect.
     ///   Callers with short prefixes (startup block-hash loads, migration
     ///   binary) always `.collect()` the result, so collecting eagerly here is
     ///   acceptable.
     pub fn iter_scan(&self, prefix: &[u8]) -> Box<dyn Iterator<Item = DBRow> + '_> {
         if self.partition_count == 1 || prefix.len() >= 3 {
             let p = self.partition_for(prefix);
-            return Box::new(self.partitions[p].iter_scan(prefix));
+            if let Some(db) = self.active_partitions.get(&p) {
+                return Box::new(db.iter_scan(prefix));
+            }
+            return Box::new(std::iter::empty());
         }
-        // Fan-out: collect results from all partitions.
+        // Fan-out: collect results from all active partitions.
         let rows: Vec<DBRow> = self
-            .partitions
-            .iter()
+            .active_partitions
+            .values()
             .flat_map(|db| db.iter_scan(prefix))
             .collect();
         Box::new(rows.into_iter())
@@ -479,50 +512,66 @@ impl PartitionedDB {
     /// Scan starting at `start_at`, yielding rows whose key begins with
     /// `prefix`.  Always dispatched to the single partition that owns
     /// `prefix` (callers always use ≥ 33-byte prefixes).
+    ///
+    /// Panics if the target partition is not active — the REST layer should
+    /// guard against this via `Config::is_hash_in_active_partition`.
     pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator<'_> {
-        self.partitions[self.partition_for(prefix)].iter_scan_from(prefix, start_at)
+        let p = self.partition_for(prefix);
+        self.active_partitions
+            .get(&p)
+            .expect("iter_scan_from called on an inactive partition")
+            .iter_scan_from(prefix, start_at)
     }
 
     /// Reverse scan ending at `prefix_max`, yielding rows whose key begins
     /// with `prefix`.  Always dispatched to the single partition that owns
     /// `prefix` (callers always use ≥ 33-byte prefixes).
+    ///
+    /// Panics if the target partition is not active — the REST layer should
+    /// guard against this via `Config::is_hash_in_active_partition`.
     pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator<'_> {
-        self.partitions[self.partition_for(prefix)].iter_scan_reverse(prefix, prefix_max)
+        let p = self.partition_for(prefix);
+        self.active_partitions
+            .get(&p)
+            .expect("iter_scan_reverse called on an inactive partition")
+            .iter_scan_reverse(prefix, prefix_max)
     }
 
     // ── Multi-get ─────────────────────────────────────────────────────────────
 
-    /// Multi-get that transparently fans out across partitions and
-    /// reassembles results in the original key order.
+    /// Multi-get that transparently fans out across active partitions and
+    /// reassembles results in the original key order.  Keys whose partition is
+    /// inactive are returned as `Ok(None)`.
     pub fn multi_get<K, I>(&self, keys: I) -> Vec<Result<Option<Vec<u8>>, rocksdb::Error>>
     where
         K: AsRef<[u8]>,
         I: IntoIterator<Item = K>,
     {
         if self.partition_count == 1 {
-            return self.partitions[0].multi_get(keys);
+            return self.active_partitions[&0].multi_get(keys);
         }
 
         let keys: Vec<K> = keys.into_iter().collect();
 
-        // Group (original_index, key_bytes) by partition.
-        let mut per_partition: Vec<Vec<(usize, &[u8])>> =
-            (0..self.partition_count).map(|_| vec![]).collect();
-        for (idx, k) in keys.iter().enumerate() {
-            per_partition[self.partition_for(k.as_ref())].push((idx, k.as_ref()));
-        }
-
-        // Placeholder vec to reassemble results in original order.
+        // Group (original_index, key_bytes) by partition, skipping inactive ones.
+        let mut per_partition: HashMap<usize, Vec<(usize, &[u8])>> = HashMap::new();
         let mut results: Vec<Option<Result<Option<Vec<u8>>, rocksdb::Error>>> =
             (0..keys.len()).map(|_| None).collect();
 
-        for (p, group) in per_partition.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
+        for (idx, k) in keys.iter().enumerate() {
+            let p = self.partition_for(k.as_ref());
+            if self.is_partition_active(p) {
+                per_partition.entry(p).or_default().push((idx, k.as_ref()));
+            } else {
+                // Inactive partition: treat as not found.
+                results[idx] = Some(Ok(None));
             }
+        }
+
+        for (p, group) in per_partition {
             let orig_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
             let group_keys: Vec<&[u8]> = group.iter().map(|(_, k)| *k).collect();
-            for (res, orig_idx) in self.partitions[p]
+            for (res, orig_idx) in self.active_partitions[&p]
                 .multi_get(group_keys)
                 .into_iter()
                 .zip(orig_indices)
@@ -537,25 +586,25 @@ impl PartitionedDB {
     // ── Maintenance ───────────────────────────────────────────────────────────
 
     pub fn full_compaction(&self) {
-        for p in &self.partitions {
-            p.full_compaction();
+        for db in self.active_partitions.values() {
+            db.full_compaction();
         }
     }
 
     pub fn enable_auto_compaction(&self) {
-        for p in &self.partitions {
-            p.enable_auto_compaction();
+        for db in self.active_partitions.values() {
+            db.enable_auto_compaction();
         }
     }
 
     pub fn start_stats_exporter(&self, db_metrics: Arc<RocksDbMetrics>, db_name: &str) {
-        for (i, p) in self.partitions.iter().enumerate() {
+        for (&i, db) in &self.active_partitions {
             let label = if self.partition_count == 1 {
                 db_name.to_string()
             } else {
                 format!("{}_{}", db_name, i)
             };
-            p.start_stats_exporter(Arc::clone(&db_metrics), &label);
+            db.start_stats_exporter(Arc::clone(&db_metrics), &label);
         }
     }
 }

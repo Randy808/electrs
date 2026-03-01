@@ -73,6 +73,12 @@ pub struct Config {
     /// based on the first 2 bytes of the hash field in each key.
     pub db_partition_count: usize,
 
+    /// If `Some((lo, hi))`, only partitions `lo..=hi` (0-indexed, inclusive) are
+    /// opened and maintained.  Writes for out-of-range partitions are silently
+    /// dropped during indexing.  API queries that hash to an out-of-range partition
+    /// receive a 400 error.  `None` (default) means all partitions are maintained.
+    pub db_partition_range: Option<(usize, usize)>,
+
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
@@ -263,6 +269,11 @@ impl Config {
                     .help("Number of RocksDB partitions per logical database (txstore, history, cache). N=1 is backward-compatible with existing data.")
                     .takes_value(true)
                     .default_value("1")
+            ).arg(
+                Arg::with_name("db_partition_range")
+                    .long("db-partition-range")
+                    .help("Inclusive range of partition indices to open, formatted as 'lo-hi' (e.g. '0-499'). Requires --db-partition-count > 1. Omit to maintain all partitions.")
+                    .takes_value(true)
             ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
@@ -504,6 +515,13 @@ impl Config {
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             db_partition_count: value_t_or_exit!(m, "db_partition_count", usize),
+            db_partition_range: m.value_of("db_partition_range").map(|s| {
+                let (lo_str, hi_str) = s.split_once('-')
+                    .expect("--db-partition-range must be formatted as 'lo-hi', e.g. '0-499'");
+                let lo: usize = lo_str.parse().expect("--db-partition-range: invalid start index");
+                let hi: usize = hi_str.parse().expect("--db-partition-range: invalid end index");
+                (lo, hi)
+            }),
             zmq_addr,
 
             #[cfg(feature = "liquid")]
@@ -522,8 +540,35 @@ impl Config {
             config.db_partition_count >= 1,
             "db-partition-count must be >= 1"
         );
+        if let Some((lo, hi)) = config.db_partition_range {
+            assert!(
+                lo <= hi,
+                "db-partition-range: start ({}) must be <= end ({})",
+                lo, hi
+            );
+            assert!(
+                hi < config.db_partition_count,
+                "db-partition-range: end ({}) must be < db-partition-count ({})",
+                hi, config.db_partition_count
+            );
+        }
         eprintln!("{:?}", config);
         config
+    }
+
+    /// Returns `true` if the given raw hash bytes (e.g. a txid or scripthash) map
+    /// to a partition that this node maintains.  Always returns `true` when no
+    /// `db_partition_range` is configured.
+    pub fn is_hash_in_active_partition(&self, hash_bytes: &[u8]) -> bool {
+        let Some((lo, hi)) = self.db_partition_range else {
+            return true;
+        };
+        if self.db_partition_count == 1 || hash_bytes.len() < 2 {
+            return true;
+        }
+        let prefix = u16::from_be_bytes([hash_bytes[0], hash_bytes[1]]);
+        let idx = (prefix as usize) * self.db_partition_count / 65536;
+        idx >= lo && idx <= hi
     }
 
     pub fn cookie_getter(&self) -> Arc<dyn CookieGetter> {
