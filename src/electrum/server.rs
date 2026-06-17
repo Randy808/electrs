@@ -462,6 +462,27 @@ impl Connection {
         Ok(json!(txid))
     }
 
+    // Ported from romanz/electrs (https://github.com/romanz/electrs).
+    fn blockchain_transaction_broadcast_package(&self, params: &[Value]) -> Result<Value> {
+        let txhexes: Vec<String> = params
+            .get(0)
+            .ok_or_else(|| invalid_params("missing transactions"))
+            .and_then(|txs| {
+                serde_json::from_value(txs.clone())
+                    .map_err(|_| invalid_params("non-array transactions"))
+            })?;
+        let verbose = bool_from_value_or(params.get(1), "verbose", false)?;
+
+        let result = self.query.submit_package(txhexes, None, None)?;
+        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate) {
+            warn!(
+                "failed to issue PeriodicUpdate after broadcast_package: {}",
+                e
+            );
+        }
+        Ok(result.into_electrum_response(verbose))
+    }
+
     fn blockchain_transaction_get(&self, params: &[Value]) -> Result<Value> {
         let tx_hash = Txid::from(hash_from_value(params.get(0))?);
         let verbose = match params.get(1) {
@@ -543,6 +564,9 @@ impl Connection {
             "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(&params),
             "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe(&params),
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(&params),
+            "blockchain.transaction.broadcast_package" => {
+                self.blockchain_transaction_broadcast_package(&params)
+            }
             "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
             "blockchain.transaction.id_from_pos" => {
