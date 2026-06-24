@@ -67,9 +67,17 @@ In addition to electrs's original configuration options, a few new options are a
 - `--cors <origins>` - origins allowed to make cross-site request (optional, defaults to none).
 - `--address-search` - enables the by-prefix address search index.
 - `--index-unspendables` - enables indexing of provably unspendable outputs.
+- `--enable-mining-rest` - enables cached mining-related HTTP endpoints.
 - `--utxos-limit <num>` - maximum number of utxos to return per address.
 - `--electrum-txs-limit <num>` - maximum number of txs to return per address in the electrum server (does not apply for the http api).
 - `--electrum-banner <text>` - welcome banner text for electrum server.
+
+### Mining-related HTTP endpoints
+
+`GET /block-template` is available only with `--enable-mining-rest`. It proxies
+the daemon's `getblocktemplate` template-mode response and caches successful
+responses for 15 seconds, invalidating early when electrs indexes a new tip.
+Callers that require fresher templates should account for this cache behavior.
 
 Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.

@@ -451,6 +451,43 @@ fn test_rest_mempool() -> Result<()> {
 }
 
 #[test]
+fn test_rest_getblocktemplate() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let tip = tester.get_best_block_hash()?;
+    let response = get(rest_addr, "/block-template")?;
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let template: Value = response.into_body().read_json()?;
+    assert_eq!(
+        template["previousblockhash"].as_str(),
+        Some(tip.to_string().as_str())
+    );
+    assert!(template["transactions"].is_array());
+    assert!(template["version"].is_i64() || template["version"].is_u64());
+    assert!(template["rules"].is_array());
+    assert!(template["bits"].is_string());
+
+    let cached_template = get_json(rest_addr, "/block-template")?;
+    assert_eq!(cached_template, template);
+
+    let new_tip = tester.mine()?;
+    let updated_template = get_json(rest_addr, "/block-template")?;
+    assert_eq!(
+        updated_template["previousblockhash"].as_str(),
+        Some(new_tip.to_string().as_str())
+    );
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
 fn test_rest_broadcast_tx() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
 

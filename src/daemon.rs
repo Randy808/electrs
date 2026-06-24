@@ -108,11 +108,7 @@ fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Resu
                     let msg = err["message"]
                         .as_str()
                         .map_or_else(|| err.to_string(), |s| s.to_string());
-                    match code {
-                        // RPC_IN_WARMUP -> retry by later reconnection
-                        -28 => bail!(ErrorKind::Connection(err.to_string())),
-                        code => bail!(ErrorKind::RpcError(code, msg, method.to_string())),
-                    }
+                    bail!(ErrorKind::RpcError(code, msg, method.to_string()))
                 }
             }
         }
@@ -733,6 +729,13 @@ impl Daemon {
                     *conn = conn.reconnect()?;
                     continue;
                 }
+                Err(e @ Error(ErrorKind::RpcError(-28, _, _), _)) => {
+                    warn!("bitcoind is warming up: {}", e.display_chain());
+                    self.signal.wait(Duration::from_secs(3), false)?;
+                    let mut conn = self.conn.lock().unwrap();
+                    *conn = conn.reconnect()?;
+                    continue;
+                }
                 result => return result,
             }
         }
@@ -741,6 +744,11 @@ impl Daemon {
     #[trace]
     fn request(&self, method: &str, params: Value) -> Result<Value> {
         self.retry_request(method, &params)
+    }
+
+    #[trace]
+    fn request_no_retry(&self, method: &str, params: Value) -> Result<Value> {
+        self.handle_request(method, &params)
     }
 
     #[trace]
@@ -931,6 +939,11 @@ impl Daemon {
     }
 
     #[trace]
+    pub fn getblocktemplate(&self, rules: &[&str]) -> Result<Value> {
+        self.request_no_retry("getblocktemplate", json!([{ "rules": rules }]))
+    }
+
+    #[trace]
     pub fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
         self.broadcast_raw(&serialize_hex(tx))
     }
@@ -1080,7 +1093,9 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use super::recycle_due;
+    use super::{parse_jsonrpc_reply, recycle_due};
+    use crate::errors::{Error, ErrorKind};
+    use serde_json::json;
     use std::time::Duration;
 
     const COOLDOWN: Duration = Duration::from_secs(30);
@@ -1116,5 +1131,21 @@ mod tests {
     #[test]
     fn expired_after_cooldown_retries() {
         assert!(recycle_due(secs(600), MAX_AGE, Some(secs(31)), COOLDOWN));
+    }
+
+    #[test]
+    fn warmup_error_parses_as_rpc_error() {
+        let reply = json!({
+            "result": null,
+            "error": { "code": -28, "message": "warming up" },
+            "id": 1
+        });
+        match parse_jsonrpc_reply(reply, "getblocktemplate", 1) {
+            Err(Error(ErrorKind::RpcError(-28, message, method), _)) => {
+                assert_eq!(message, "warming up");
+                assert_eq!(method, "getblocktemplate");
+            }
+            other => panic!("unexpected getblocktemplate warmup result: {:?}", other),
+        }
     }
 }
