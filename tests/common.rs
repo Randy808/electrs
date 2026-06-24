@@ -107,6 +107,7 @@ impl TestRunner {
             light_mode: false,
             address_search: true,
             index_unspendables: false,
+            enable_mining_rest: true,
             cors: None,
             precache_scripts: None,
             utxos_limit: 100,

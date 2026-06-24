@@ -38,6 +38,7 @@ pub struct Config {
     pub light_mode: bool,
     pub address_search: bool,
     pub index_unspendables: bool,
+    pub enable_mining_rest: bool,
     pub cors: Option<String>,
     pub precache_scripts: Option<String>,
     pub utxos_limit: usize,
@@ -211,6 +212,11 @@ impl Config {
                 Arg::with_name("index_unspendables")
                     .long("index-unspendables")
                     .help("Enable indexing of provably unspendable outputs")
+            )
+            .arg(
+                Arg::with_name("enable_mining_rest")
+                    .long("enable-mining-rest")
+                    .help("Enable cached mining-related HTTP endpoints")
             )
             .arg(
                 Arg::with_name("cors")
@@ -531,6 +537,7 @@ impl Config {
             light_mode: m.is_present("light_mode"),
             address_search: m.is_present("address_search"),
             index_unspendables: m.is_present("index_unspendables"),
+            enable_mining_rest: m.is_present("enable_mining_rest"),
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
             db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
