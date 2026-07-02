@@ -317,6 +317,134 @@ fn test_electrum_scripthash_get_mempool() -> Result<()> {
     Ok(())
 }
 
+/// Test blockchain.transaction.broadcast_package submits a package via bitcoind's submitpackage
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_electrum_broadcast_package() -> Result<()> {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let (_electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+
+    let addr = tester.newaddress()?;
+    // create a tx; it stays in the mempool, so re-submitting it as a 1-tx package succeeds
+    let txid = tester.send(&addr, "0.1 BTC".parse().unwrap())?;
+    let tx_hex = serialize_hex(&tester.get_raw_transaction(txid)?);
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+
+    // non-verbose: returns { "success": true }
+    let s = write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.transaction.broadcast_package\", \"params\": [[\"{}\"]], \"id\": 1}}",
+            tx_hex
+        ),
+    );
+    let v: electrumd::jsonrpc::serde_json::Value =
+        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    assert_eq!(
+        v["result"]["success"].as_bool(),
+        Some(true),
+        "unexpected response: {}",
+        s
+    );
+
+    // verbose: returns the full submitpackage result, including package_msg
+    let s = write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.transaction.broadcast_package\", \"params\": [[\"{}\"], true], \"id\": 2}}",
+            tx_hex
+        ),
+    );
+    let v: electrumd::jsonrpc::serde_json::Value =
+        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    assert_eq!(
+        v["result"]["package_msg"].as_str(),
+        Some("success"),
+        "unexpected verbose response: {}",
+        s
+    );
+
+    Ok(())
+}
+
+/// Regression test: a package broadcast must add accepted txs to electrs' local mempool, so a
+/// subscribed/queried scripthash sees them immediately (not only after the next background sync).
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_electrum_broadcast_package_updates_mempool() -> Result<()> {
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::hex::DisplayHex;
+
+    let (_electrum_server, electrum_addr, tester) = common::init_electrum_tester()?;
+
+    let addr = tester.newaddress()?;
+    let mut hash = sha256::Hash::hash(addr.script_pubkey().as_bytes()).to_byte_array();
+    hash.reverse();
+    let scripthash = hash.to_lower_hex_string();
+
+    // Create a tx via the node directly, WITHOUT tester.send() -- so electrs does not sync it into
+    // its local mempool. The tx is in bitcoind's mempool but unknown to electrs.
+    let amount = bitcoin::Amount::from_btc(0.1).unwrap();
+    let txid: bitcoin::Txid = tester
+        .node_client()
+        .call(
+            "sendtoaddress",
+            &[addr.to_string().into(), json!(amount.to_btc())],
+        )
+        .unwrap();
+    let tx_hex = serialize_hex(&tester.get_raw_transaction(txid)?);
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+
+    let history = |stream: &mut TcpStream, id: u32| -> Vec<String> {
+        let s = write_and_read(
+            stream,
+            &format!(
+                "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.scripthash.get_history\", \"params\": [\"{}\"], \"id\": {}}}",
+                scripthash, id
+            ),
+        );
+        let v: electrumd::jsonrpc::serde_json::Value =
+            electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+        v["result"]
+            .as_array()
+            .expect("result array")
+            .iter()
+            .map(|e| e["tx_hash"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // electrs has not synced the tx yet, so its history is empty
+    assert!(
+        history(&mut stream, 1).is_empty(),
+        "tx should not be in electrs' mempool before broadcast_package"
+    );
+
+    // broadcast the (already-in-bitcoind-mempool) tx as a 1-tx package
+    let s = write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.transaction.broadcast_package\", \"params\": [[\"{}\"]], \"id\": 2}}",
+            tx_hex
+        ),
+    );
+    let v: electrumd::jsonrpc::serde_json::Value =
+        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    assert_eq!(v["result"]["success"].as_bool(), Some(true), "response: {}", s);
+
+    // the accepted tx must now be visible in the scripthash history immediately
+    assert_eq!(
+        history(&mut stream, 3),
+        vec![txid.to_string()],
+        "broadcast_package did not add the accepted tx to electrs' local mempool"
+    );
+
+    Ok(())
+}
+
 fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
     stream.write_all(write.as_bytes()).unwrap();
     stream.write(b"\n").unwrap();

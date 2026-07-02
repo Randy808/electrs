@@ -1241,6 +1241,57 @@ fn test_rest_submit_package() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: POST /txs/package must add accepted txs to electrs' local mempool, so they are
+/// immediately visible via the address/scripthash endpoints (not only after the next background sync).
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_rest_package_updates_mempool() -> Result<()> {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let (rest_handle, rest_addr, tester) = common::init_rest_tester().unwrap();
+
+    let addr = tester.newaddress()?;
+
+    // Create a tx via the node directly, WITHOUT tester.send() -- so electrs does not sync it into
+    // its local mempool. The tx is in bitcoind's mempool but unknown to electrs.
+    let txid: Txid = tester
+        .node_client()
+        .call("sendtoaddress", &[addr.to_string().into(), 0.1.into()])
+        .unwrap();
+    let tx_hex = serialize_hex(&tester.get_raw_transaction(txid)?);
+
+    let addr_txids = |rest_addr: net::SocketAddr| -> Vec<String> {
+        get_json(rest_addr, &format!("/address/{}/txs", addr))
+            .unwrap()
+            .as_array()
+            .expect("txs array")
+            .iter()
+            .map(|tx| tx["txid"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // electrs has not synced the tx yet, so the address has no txs
+    assert!(
+        addr_txids(rest_addr).is_empty(),
+        "tx should not be in electrs' mempool before the package is submitted"
+    );
+
+    // submit the (already-in-bitcoind-mempool) tx as a 1-tx package
+    let package_resp =
+        ureq::post(&format!("http://{}/txs/package", rest_addr)).send_json([tx_hex])?;
+    assert_eq!(package_resp.status(), 200);
+
+    // the accepted tx must now be visible immediately via the address endpoint
+    assert_eq!(
+        addr_txids(rest_addr),
+        vec![txid.to_string()],
+        "POST /txs/package did not add the accepted tx to electrs' local mempool"
+    );
+
+    rest_handle.stop();
+    Ok(())
+}
+
 // Elements-only tests
 
 #[cfg(feature = "liquid")]

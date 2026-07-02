@@ -322,6 +322,28 @@ impl Mempool {
         }
     }
 
+    /// Add multiple transactions (e.g. an accepted package) to the mempool in a single batch,
+    /// so that interdependent parent/child txs are linked within the same `add` call. Txids that
+    /// are already present or cannot be fetched from the daemon are skipped.
+    pub fn add_by_txids(&mut self, daemon: &Daemon, txids: &[Txid]) -> Result<()> {
+        let mut txs_map = HashMap::new();
+        for &txid in txids {
+            if self.txstore.get(&txid).is_some() {
+                continue;
+            }
+            match daemon.getmempooltx(&txid) {
+                Ok(tx) => {
+                    txs_map.insert(txid, tx);
+                }
+                Err(e) => warn!("add_by_txids cannot find txid='{}': e='{}'", txid, e),
+            }
+        }
+        if txs_map.is_empty() {
+            return Ok(());
+        }
+        self.add(txs_map)
+    }
+
     #[trace]
     fn add(&mut self, txs_map: HashMap<Txid, Transaction>) -> Result<()> {
         self.delta

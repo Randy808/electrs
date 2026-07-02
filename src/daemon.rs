@@ -182,6 +182,46 @@ pub struct TxResult {
     error: Option<String>,
 }
 
+impl SubmitPackageResult {
+    /// Txids of the transactions accepted into the daemon's mempool by this package submission
+    /// (those without a per-transaction error).
+    pub fn accepted_txids(&self) -> Vec<Txid> {
+        self.tx_results
+            .values()
+            .filter(|tx| tx.error.is_none())
+            .filter_map(|tx| Txid::from_str(&tx.txid).ok())
+            .collect()
+    }
+
+    /// Build the response for the Electrum `blockchain.transaction.broadcast_package` method.
+    ///
+    /// When `verbose` is true, the full `submitpackage` result is returned. Otherwise a compact
+    /// `{ success, errors? }` object is returned, where `success` is whether the package was
+    /// accepted and `errors` lists any per-transaction errors.
+    ///
+    /// Ported from romanz/electrs (https://github.com/romanz/electrs).
+    pub fn into_electrum_response(self, verbose: bool) -> Value {
+        if verbose {
+            return json!(self);
+        }
+        let success = self.package_msg == "success";
+        let errors: Vec<Value> = self
+            .tx_results
+            .values()
+            .filter_map(|tx| {
+                tx.error
+                    .as_ref()
+                    .map(|error| json!({ "error": error, "txid": tx.txid }))
+            })
+            .collect();
+        if errors.is_empty() {
+            json!({ "success": success })
+        } else {
+            json!({ "success": success, "errors": errors })
+        }
+    }
+}
+
 pub trait CookieGetter: Send + Sync {
     fn get(&self) -> Result<Vec<u8>>;
 }
