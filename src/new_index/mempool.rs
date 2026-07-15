@@ -7,7 +7,7 @@ use electrs_macros::trace;
 #[cfg(feature = "liquid")]
 use elements::{encode::serialize, AssetId};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -523,17 +523,25 @@ impl Mempool {
                 // owned by the conflicting tx). That's recoverable bookkeeping
                 // noise, not a reason to crash the server (seen ~1/h on
                 // mainnet, 2026-07-15).
-                match self.edges.get(&txin.previous_output) {
-                    Some((spending_txid, _)) if spending_txid == *txid => {
-                        self.edges.remove(&txin.previous_output);
+                match self.edges.entry(txin.previous_output) {
+                    Entry::Occupied(entry) if entry.get().0 == **txid => {
+                        entry.remove();
                     }
-                    other => {
+                    Entry::Occupied(entry) => {
                         warn!(
-                            "mempool edge for outpoint {}:{} not owned by evicted tx {} (found {:?})",
+                            "mempool edge for outpoint {}:{} owned by conflicting tx {} (evicting {})",
                             txin.previous_output.txid,
                             txin.previous_output.vout,
-                            txid,
-                            other
+                            entry.get().0,
+                            txid
+                        );
+                    }
+                    Entry::Vacant(_) => {
+                        warn!(
+                            "mempool edge for outpoint {}:{} already gone (evicting {})",
+                            txin.previous_output.txid,
+                            txin.previous_output.vout,
+                            txid
                         );
                     }
                 }
