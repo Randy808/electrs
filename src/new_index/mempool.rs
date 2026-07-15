@@ -516,13 +516,27 @@ impl Mempool {
             prune_history_entries(&mut self.history, &scripthashes, txid);
 
             for txin in tx.input {
-                assert!(
-                    self.edges.remove(&txin.previous_output).is_some(),
-                    "missing mempool edge for outpoint {}:{} (tx {})",
-                    txin.previous_output.txid,
-                    txin.previous_output.vout,
-                    txid
-                );
+                // Don't assert here: when conflicting (RBF) spends transiently
+                // coexist across mempool snapshot rounds, the later `add()`
+                // overwrites the earlier tx's entry in `edges`, so evicting
+                // the earlier tx finds its outpoint entry already gone (or
+                // owned by the conflicting tx). That's recoverable bookkeeping
+                // noise, not a reason to crash the server (seen ~1/h on
+                // mainnet, 2026-07-15).
+                match self.edges.get(&txin.previous_output) {
+                    Some((spending_txid, _)) if spending_txid == *txid => {
+                        self.edges.remove(&txin.previous_output);
+                    }
+                    other => {
+                        warn!(
+                            "mempool edge for outpoint {}:{} not owned by evicted tx {} (found {:?})",
+                            txin.previous_output.txid,
+                            txin.previous_output.vout,
+                            txid,
+                            other
+                        );
+                    }
+                }
             }
         }
 
