@@ -198,7 +198,6 @@ fn test_rest_address() -> Result<()> {
     let addr1_prefix = &addr1.to_string()[0..8];
     let res = get_json(rest_addr, &format!("/address-prefix/{}", addr1_prefix))?;
     let found = res.as_array().expect("array of matching addresses");
-    assert!(!found.is_empty());
     assert!(found
         .iter()
         .any(|a| a.as_str() == Some(addr1.to_string().as_str())));

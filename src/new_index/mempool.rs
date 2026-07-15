@@ -516,13 +516,15 @@ impl Mempool {
             prune_history_entries(&mut self.history, &scripthashes, txid);
 
             for txin in tx.input {
-                // Don't assert here: when conflicting (RBF) spends transiently
-                // coexist across mempool snapshot rounds, the later `add()`
-                // overwrites the earlier tx's entry in `edges`, so evicting
-                // the earlier tx finds its outpoint entry already gone (or
-                // owned by the conflicting tx). That's recoverable bookkeeping
-                // noise, not a reason to crash the server (seen ~1/h on
-                // mainnet, 2026-07-15).
+                // Don't assert here: conflicting (RBF) spends can transiently
+                // coexist in the local view. update() itself is safe (evictions
+                // are applied before additions, diffed against one consistent
+                // bitcoind snapshot), but Query::broadcast_raw()/submit_package()
+                // inject transactions via add_by_txid(s) outside the sync loop -
+                // broadcasting a replacement while the original is still indexed
+                // makes the later add() clobber the original's `edges` entry.
+                // Evicting the original then finds its entry gone or foreign.
+                // Recoverable bookkeeping noise, not a reason to crash.
                 match self.edges.entry(txin.previous_output) {
                     Entry::Occupied(entry) if entry.get().0 == **txid => {
                         entry.remove();
