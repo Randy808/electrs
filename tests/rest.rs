@@ -1540,3 +1540,88 @@ fn test_rest_liquid_block() -> Result<()> {
     rest_handle.stop();
     Ok(())
 }
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_rest_mempool_rbf_eviction() -> Result<()> {
+    // Regression test for the mempool eviction panic ("missing mempool edge
+    // for outpoint"): tx A and its RBF replacement B spend the same outpoint
+    // and transiently coexist in the local mempool view when B is injected
+    // through the broadcast endpoint (add_by_txid) while A is still indexed.
+    // B's add() clobbers A's `edges` entry; the next sync round evicts A and
+    // must tolerate the missing/foreign edge instead of panicking.
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    // Broadcast tx A via the node wallet, explicitly BIP125-replaceable,
+    // and index it into the local mempool view.
+    let addr1 = tester.newaddress()?;
+    let txid_a: Txid = tester.node_client().call(
+        "sendtoaddress",
+        &[
+            serde_json::json!(addr1.to_string()),
+            serde_json::json!(0.5),
+            serde_json::json!(null),
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(true), // replaceable
+        ],
+    )?;
+    tester.sync()?;
+    let res = get_json(rest_addr, &format!("/tx/{}", txid_a))?;
+    assert_eq!(res["status"]["confirmed"].as_bool(), Some(false));
+
+    // Build replacement B (same inputs, higher fee) WITHOUT broadcasting it
+    // through the node, so the node's mempool still holds A.
+    let bumped: Value = tester
+        .node_client()
+        .call("psbtbumpfee", &[serde_json::json!(txid_a.to_string())])?;
+    let processed: Value = tester
+        .node_client()
+        .call("walletprocesspsbt", &[bumped["psbt"].clone()])?;
+    assert_eq!(processed["complete"].as_bool(), Some(true));
+    let finalized: Value = tester
+        .node_client()
+        .call("finalizepsbt", &[processed["psbt"].clone()])?;
+    let b_hex = finalized["hex"].as_str().expect("finalized tx hex");
+
+    // Inject B through the electrs broadcast endpoint: the node accepts the
+    // replacement (evicting A node-side), and add_by_txid() indexes B locally
+    // while A is still present - clobbering A's edges entry for the shared
+    // outpoint.
+    let broadcast_resp = ureq::post(&format!("http://{}/tx", rest_addr)).send(b_hex)?;
+    assert_eq!(broadcast_resp.status(), 200);
+    let txid_b = broadcast_resp.into_body().read_to_string()?;
+
+    // The next sync evicts A from the local view. The unfixed code passes the
+    // eviction assert here - but only by STEALING B's edge entry (any Some()
+    // satisfied it), which is the actual arming step of the crash.
+    tester.sync()?;
+
+    // B remains queryable in the mempool; A is gone.
+    let res = get_json(rest_addr, &format!("/tx/{}", txid_b.trim()))?;
+    assert_eq!(res["status"]["confirmed"].as_bool(), Some(false));
+    let gone = ureq::get(&format!("http://{}/tx/{}", rest_addr, txid_a))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(gone.status(), 404);
+
+    // Now B itself leaves the mempool (confirmed here; RBF-of-B or expiry are
+    // equivalent). Evicting B finds its edge entry gone - stolen by A's
+    // eviction above - and the unfixed code panics with "missing mempool edge
+    // for outpoint", killing the sync loop. The fixed code only removes an
+    // edge its evicted tx still owns, so B's edge survived A's eviction and
+    // this round stays clean.
+    tester.mine()?;
+    tester.sync()?;
+
+    let res = get_json(rest_addr, &format!("/tx/{}", txid_b.trim()))?;
+    assert_eq!(res["status"]["confirmed"].as_bool(), Some(true));
+
+    // And the server is still fully alive.
+    let _tip = get_plain(rest_addr, "/blocks/tip/height")?;
+
+    rest_handle.stop();
+    Ok(())
+}
