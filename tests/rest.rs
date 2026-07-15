@@ -191,11 +191,17 @@ fn test_rest_address() -> Result<()> {
     assert!(txids.is_empty());
 
     // Test GET /address-prefix/:prefix
+    // Assert addr1 is among the matches rather than the only one: other
+    // randomly-generated wallet addresses (e.g. change) can legitimately
+    // share the 8-char prefix (~1/1024 per address), which made this
+    // assertion flaky as an exact len()==1 check.
     let addr1_prefix = &addr1.to_string()[0..8];
     let res = get_json(rest_addr, &format!("/address-prefix/{}", addr1_prefix))?;
     let found = res.as_array().expect("array of matching addresses");
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].as_str(), Some(addr1.to_string().as_str()));
+    assert!(!found.is_empty());
+    assert!(found
+        .iter()
+        .any(|a| a.as_str() == Some(addr1.to_string().as_str())));
 
     rest_handle.stop();
     Ok(())
