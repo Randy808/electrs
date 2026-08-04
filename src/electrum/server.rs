@@ -1,14 +1,16 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bitcoin::hashes::{sha256, sha256d::Hash as Sha256dHash, Hash, HashEngine};
 use bitcoin::hex::DisplayHex;
 use error_chain::ChainedError;
+use rand::Rng;
 use serde_json::{from_str, Value};
 
 use electrs_macros::trace;
@@ -158,7 +160,9 @@ struct Connection {
     query: Arc<Query>,
     last_header_entry: Option<HeaderEntry>,
     status_hashes: HashMap<Sha256dHash, Value>, // ScriptHash -> StatusHash
-    stream: TcpStream,
+    // Shared with the connection reaper (via a Weak), which enforces the
+    // maximum connection age by shutting the socket down at the deadline.
+    stream: Arc<TcpStream>,
     addr: SocketAddr,
     sender: SyncSender<Message>,
     stats: Arc<Stats>,
@@ -179,7 +183,7 @@ fn hash_ip_with_salt(salt: &str, ip: &str) -> String {
 impl Connection {
     pub fn new(
         query: Arc<Query>,
-        stream: TcpStream,
+        stream: Arc<TcpStream>,
         addr: SocketAddr,
         sender: SyncSender<Message>,
         stats: Arc<Stats>,
@@ -667,7 +671,7 @@ impl Connection {
     fn send_values(&mut self, values: &[Value]) -> Result<()> {
         for value in values {
             let line = value.to_string() + "\n";
-            self.stream
+            (&*self.stream)
                 .write_all(line.as_bytes())
                 .chain_err(|| format!("failed to send response ({} bytes)", line.len()))?;
         }
@@ -787,7 +791,9 @@ impl Connection {
     fn reader_thread(reader: BufReader<TcpStream>, tx: SyncSender<Message>) -> Result<()> {
         let result = Connection::parse_requests(reader, &tx);
         if let Err(e) = tx.send(Message::Done) {
-            warn!("failed closing channel: {}", e);
+            // The writer already tore the channel down (e.g. after a write
+            // error or connection expiry) — expected during teardown races.
+            debug!("failed closing channel: {}", e);
         }
         result
     }
@@ -821,7 +827,142 @@ impl Connection {
 
         let _ = self.stream.shutdown(Shutdown::Both);
         if let Err(err) = child.join().expect("receiver panicked") {
-            error!("[{}] receiver failed: {}", self.addr, err);
+            if is_disconnect(&err) || is_channel_closed(&err) {
+                // Reader failures rooted in a disconnect or in the reply
+                // channel tearing down are expected when the socket was shut
+                // down under it (client reset or expiry).
+                debug!("[{}] receiver closed: {}", self.addr, err);
+            } else {
+                error!("[{}] receiver failed: {}", self.addr, err);
+            }
+        }
+    }
+}
+
+fn connection_lifetime(max_age: Option<Duration>) -> Option<Duration> {
+    max_age.and_then(|max_age| {
+        let max_secs = max_age.as_secs();
+        if max_secs == 0 {
+            return None;
+        }
+        let min_secs = max_secs / 2 + max_secs % 2;
+        Some(Duration::from_secs(
+            rand::rng().random_range(min_secs..=max_secs),
+        ))
+    })
+}
+
+/// The absolute deadline for a new connection, jittered between 50% and 100% of
+/// `max_age`. `None` means the connection never expires — either the max age is
+/// disabled, or it is so large that the deadline is not representable.
+fn connection_deadline(max_age: Option<Duration>) -> Option<Instant> {
+    connection_lifetime(max_age).and_then(|lifetime| Instant::now().checked_add(lifetime))
+}
+
+/// A connection registered with the reaper: shut `stream` down at `expires_at`.
+struct ConnectionExpiry {
+    expires_at: Instant,
+    addr: SocketAddr,
+    // Weak so the reaper never keeps the socket (and its fd) alive after the
+    // connection ends on its own before the deadline.
+    stream: Weak<TcpStream>,
+}
+
+enum ReaperMessage {
+    Register(ConnectionExpiry),
+    Shutdown,
+}
+
+// Ordered by soonest deadline first, so a BinaryHeap acts as a min-heap.
+impl Ord for ConnectionExpiry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.expires_at.cmp(&self.expires_at)
+    }
+}
+
+impl PartialOrd for ConnectionExpiry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ConnectionExpiry {
+    fn eq(&self, other: &Self) -> bool {
+        self.expires_at == other.expires_at
+    }
+}
+
+impl Eq for ConnectionExpiry {}
+
+/// Compact the expiry queue once it reaches this many entries.
+const REAPER_COMPACT_MIN: usize = 1024;
+
+/// Pending connection expiries, ordered by soonest deadline. Entries for
+/// connections that ended before their deadline are dropped by an amortized
+/// compaction pass on registration, so the queue stays proportional to the
+/// number of live connections even under high connection churn combined with
+/// a large max age.
+struct ExpiryQueue {
+    expiries: BinaryHeap<ConnectionExpiry>,
+    compact_at: usize,
+}
+
+impl ExpiryQueue {
+    fn new() -> ExpiryQueue {
+        ExpiryQueue {
+            expiries: BinaryHeap::new(),
+            compact_at: REAPER_COMPACT_MIN,
+        }
+    }
+
+    fn register(&mut self, expiry: ConnectionExpiry) {
+        self.expiries.push(expiry);
+        if self.expiries.len() >= self.compact_at {
+            self.expiries.retain(|e| e.stream.strong_count() > 0);
+            self.compact_at = REAPER_COMPACT_MIN.max(self.expiries.len() * 2);
+        }
+    }
+
+    /// Shut down every connection whose deadline has passed.
+    fn reap_due(&mut self, now: Instant) {
+        while self.expiries.peek().map_or(false, |e| e.expires_at <= now) {
+            let expiry = self.expiries.pop().unwrap();
+            // A connection that already ended no longer upgrades.
+            if let Some(stream) = expiry.stream.upgrade() {
+                debug!(
+                    "[{}] maximum connection age reached, closing connection",
+                    expiry.addr
+                );
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.expiries.peek().map(|e| e.expires_at)
+    }
+}
+
+/// Enforces the maximum connection age for all Electrum RPC connections by
+/// shutting each socket down at its absolute deadline. The shutdown unblocks
+/// both peer threads even when the writer is stuck in a blocking write to a
+/// client that stopped reading, which an in-band expiry check between messages
+/// could never catch. Runs until a `Shutdown` message arrives or the
+/// registration channel is closed.
+fn reap_expired_connections(registrations: Receiver<ReaperMessage>) {
+    let mut queue = ExpiryQueue::new();
+    loop {
+        queue.reap_due(Instant::now());
+        let next = match queue.next_deadline() {
+            Some(deadline) => {
+                registrations.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            }
+            None => registrations.recv().map_err(RecvTimeoutError::from),
+        };
+        match next {
+            Ok(ReaperMessage::Register(registration)) => queue.register(registration),
+            Ok(ReaperMessage::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -839,6 +980,20 @@ fn is_disconnect(err: &Error) -> bool {
             ) {
                 return true;
             }
+        }
+        cause = e.source();
+    }
+    false
+}
+
+/// True if the error chain is rooted in the reply channel closing, meaning the
+/// writer half tore down first (e.g. on connection expiry or a write error)
+/// while the reader still had a request in flight — expected during teardown.
+fn is_channel_closed(err: &Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cause {
+        if e.downcast_ref::<mpsc::SendError<Message>>().is_some() {
+            return true;
         }
         cause = e.source();
     }
@@ -893,7 +1048,7 @@ impl RPC {
     fn start_notifier(
         notification: Channel<Notification>,
         senders: Arc<Mutex<Vec<SyncSender<Message>>>>,
-        acceptor: Sender<Option<(TcpStream, SocketAddr)>>,
+        acceptor: Sender<Option<(Arc<TcpStream>, SocketAddr)>>,
     ) {
         spawn_thread("notification", move || {
             for msg in notification.receiver().iter() {
@@ -920,7 +1075,11 @@ impl RPC {
         });
     }
 
-    fn start_acceptor(addr: SocketAddr) -> Channel<Option<(TcpStream, SocketAddr)>> {
+    fn start_acceptor(
+        addr: SocketAddr,
+        conn_max_age: Option<Duration>,
+        reaper: Option<mpsc::Sender<ReaperMessage>>,
+    ) -> Channel<Option<(Arc<TcpStream>, SocketAddr)>> {
         let chan = Channel::unbounded();
         let acceptor = chan.sender();
         spawn_thread("acceptor", move || {
@@ -938,6 +1097,19 @@ impl RPC {
                     .set_nonblocking(false)
                     .expect("failed to set connection as blocking");
                 stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
+                // Register with the reaper before enqueueing, so the deadline
+                // is anchored to the accept and enforced even while the socket
+                // waits behind other new connections during an accept burst.
+                let stream = Arc::new(stream);
+                if let Some(reaper) = &reaper {
+                    if let Some(expires_at) = connection_deadline(conn_max_age) {
+                        let _ = reaper.send(ReaperMessage::Register(ConnectionExpiry {
+                            expires_at,
+                            addr,
+                            stream: Arc::downgrade(&stream),
+                        }));
+                    }
+                }
                 if acceptor.send(Some((stream, addr))).is_err() {
                     break; // receiver dropped, server is shutting down
                 }
@@ -994,13 +1166,28 @@ impl RPC {
 
         let rpc_addr = config.electrum_rpc_addr;
         let txs_limit = config.electrum_txs_limit;
+        let conn_max_age = config.electrum_rpc_conn_max_age;
 
         RPC {
             notification: notification.sender(),
             server: Some(spawn_thread("rpc", move || {
                 let senders = Arc::new(Mutex::new(Vec::<SyncSender<Message>>::new()));
 
-                let acceptor = RPC::start_acceptor(rpc_addr);
+                // The reaper enforces the maximum connection age. It is
+                // stopped with an explicit Shutdown message below, since the
+                // acceptor's sender clone can outlive this thread (the
+                // acceptor stays blocked in accept() during shutdown).
+                let reaper = conn_max_age.map(|_| {
+                    let (sender, receiver) = mpsc::channel();
+                    let handle = spawn_thread("reaper", move || reap_expired_connections(receiver));
+                    (sender, handle)
+                });
+
+                let acceptor = RPC::start_acceptor(
+                    rpc_addr,
+                    conn_max_age,
+                    reaper.as_ref().map(|(sender, _)| sender.clone()),
+                );
                 RPC::start_notifier(notification, senders.clone(), acceptor.sender());
 
                 let mut threads = HashMap::new();
@@ -1064,6 +1251,12 @@ impl RPC {
                 }
 
                 trace!("RPC connections are closed");
+
+                if let Some((sender, handle)) = reaper {
+                    let _ = sender.send(ReaperMessage::Shutdown);
+                    handle.join().expect("reaper panicked");
+                    trace!("reaper stopped");
+                }
             })),
         }
     }
@@ -1096,5 +1289,158 @@ mod tests {
             result,
             "d474826bbd126d38bdfb1e61bf727a2d9a306ea1645071faf2638cc3891a2b30"
         );
+    }
+
+    #[test]
+    fn connection_lifetime_is_disabled_without_max_age() {
+        assert_eq!(connection_lifetime(None), None);
+        assert_eq!(connection_lifetime(Some(Duration::ZERO)), None);
+    }
+
+    #[test]
+    fn connection_lifetime_is_jittered_up_to_max_age() {
+        let max_age = Duration::from_secs(3_600);
+        for _ in 0..100 {
+            let lifetime = connection_lifetime(Some(max_age)).unwrap();
+            assert!(lifetime >= Duration::from_secs(1_800));
+            assert!(lifetime <= max_age);
+        }
+    }
+
+    #[test]
+    fn connection_expiry_does_not_overflow() {
+        // A max age too large to be representable as a deadline must mean
+        // "never expires", not a panic.
+        assert_eq!(
+            connection_deadline(Some(Duration::from_secs(u64::MAX))),
+            None
+        );
+        assert_eq!(connection_deadline(None), None);
+        assert!(connection_deadline(Some(Duration::from_secs(3_600))).is_some());
+    }
+
+    /// Spawn a reaper and register `stream` to expire at `expires_at`.
+    fn spawn_reaper(stream: &Arc<TcpStream>, expires_at: Instant) -> mpsc::Sender<ReaperMessage> {
+        let (registrations, receiver) = mpsc::channel();
+        thread::spawn(move || reap_expired_connections(receiver));
+        registrations
+            .send(ReaperMessage::Register(ConnectionExpiry {
+                expires_at,
+                addr: stream.peer_addr().unwrap(),
+                stream: Arc::downgrade(stream),
+            }))
+            .unwrap();
+        registrations
+    }
+
+    #[test]
+    fn reaper_stops_on_shutdown_message() {
+        let (registrations, receiver) = mpsc::channel();
+        let reaper = thread::spawn(move || reap_expired_connections(receiver));
+        // A pending far-future registration must not delay the shutdown.
+        registrations
+            .send(ReaperMessage::Register(ConnectionExpiry {
+                expires_at: Instant::now() + Duration::from_secs(3_600),
+                addr: "127.0.0.1:1".parse().unwrap(),
+                stream: std::sync::Weak::new(),
+            }))
+            .unwrap();
+        registrations.send(ReaperMessage::Shutdown).unwrap();
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn reaper_closes_connection_of_client_that_stops_reading() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // A client that never reads its socket: writes towards it fill the
+        // kernel buffers and then block indefinitely.
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = Arc::new(listener.accept().unwrap().0);
+
+        let started = Instant::now();
+        let expires_at = started + Duration::from_millis(200);
+        let _registrations = spawn_reaper(&stream, expires_at);
+
+        let (done_sender, done_receiver) = mpsc::channel();
+        let writer = Arc::clone(&stream);
+        thread::spawn(move || {
+            let chunk = [0u8; 1 << 20];
+            while (&*writer).write_all(&chunk).is_ok() {}
+            let _ = done_sender.send(());
+        });
+
+        // The blocked write must be forced to fail at the deadline, not linger
+        // for as long as the client keeps the socket open.
+        done_receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("writer stayed blocked past the connection deadline");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        drop(client);
+    }
+
+    #[test]
+    fn reaper_queue_drops_entries_of_finished_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (live_stream, addr) = listener.accept().unwrap();
+        let live_stream = Arc::new(live_stream);
+
+        // A Weak whose connection already ended (strong count is zero).
+        let dead = {
+            let stream = Arc::new(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+            Arc::downgrade(&stream)
+        };
+
+        // Far-future deadlines: without compaction, the entries below would
+        // all sit in the queue until the deadline no matter that their
+        // connections are long gone.
+        let expires_at = Instant::now() + Duration::from_secs(3_600);
+        let mut queue = ExpiryQueue::new();
+        for _ in 0..(REAPER_COMPACT_MIN - 1) {
+            queue.register(ConnectionExpiry {
+                expires_at,
+                addr,
+                stream: dead.clone(),
+            });
+        }
+        // This registration reaches the compaction threshold, so the pass runs
+        // with both the dead entries and this live one in the queue.
+        queue.register(ConnectionExpiry {
+            expires_at,
+            addr,
+            stream: Arc::downgrade(&live_stream),
+        });
+
+        // Compaction dropped the dead entries and kept the live one.
+        assert_eq!(queue.expiries.len(), 1);
+        assert!(queue.expiries.peek().unwrap().stream.upgrade().is_some());
+    }
+
+    #[test]
+    fn reply_channel_teardown_is_not_logged_as_error() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let err: Error = sender
+            .send(Message::Done)
+            .chain_err(|| "channel closed")
+            .unwrap_err();
+        assert!(is_channel_closed(&err));
+        assert!(!is_channel_closed(&"unrelated".into()));
+    }
+
+    #[test]
+    fn reaper_does_not_keep_finished_connections_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = Arc::new(listener.accept().unwrap().0);
+
+        let weak = Arc::downgrade(&stream);
+        let _registrations = spawn_reaper(&stream, Instant::now() + Duration::from_secs(3_600));
+
+        // The reaper holds only a Weak: once the connection is done with the
+        // stream, the socket must close immediately instead of staying open
+        // (leaking the fd) until the deadline.
+        drop(stream);
+        assert!(weak.upgrade().is_none());
     }
 }
