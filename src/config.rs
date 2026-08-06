@@ -31,6 +31,7 @@ pub struct Config {
     pub daemon_conn_max_age: Option<Duration>,
     pub cookie: Option<String>,
     pub electrum_rpc_addr: SocketAddr,
+    pub electrum_rpc_conn_max_age: Option<Duration>,
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
@@ -154,6 +155,13 @@ impl Config {
                 Arg::with_name("electrum_rpc_addr")
                     .long("electrum-rpc-addr")
                     .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet3, '127.0.0.1:40001' for testnet4 and '127.0.0.1:60401' for regtest)")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_conn_max_age")
+                    .long("electrum-rpc-conn-max-age")
+                    .help("Maximum age (in seconds) of inbound Electrum RPC TCP connections. Each connection is closed at a randomly selected age between 50% and 100% of this value so clients reconnect gradually and load balancers can redistribute them. 0 = unlimited / never disconnect (default)")
+                    .default_value("0")
                     .takes_value(true),
             )
             .arg(
@@ -451,6 +459,11 @@ impl Config {
                 .unwrap_or(&format!("127.0.0.1:{}", default_electrum_port)),
             "Electrum RPC",
         );
+        let electrum_rpc_conn_max_age: Option<Duration> =
+            match value_t_or_exit!(m, "electrum_rpc_conn_max_age", u64) {
+                0 => None, // 0 = unlimited / never disconnect
+                secs => Some(Duration::from_secs(secs)),
+            };
         let http_addr: SocketAddr = str_to_socketaddr(
             m.value_of("http_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
@@ -519,6 +532,7 @@ impl Config {
             cookie,
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
             electrum_rpc_addr,
+            electrum_rpc_conn_max_age,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_banner,
             rpc_logging: {

@@ -100,6 +100,7 @@ impl TestRunner {
             daemon_rpc_fallback_addr: None,
             cookie: None,
             electrum_rpc_addr: rand_available_addr(),
+            electrum_rpc_conn_max_age: None,
             http_addr: rand_available_addr(),
             http_socket_file: None, // XXX test with socket file or tcp?
             monitoring_addr: rand_available_addr(),
