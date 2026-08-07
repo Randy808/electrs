@@ -106,7 +106,7 @@ impl JsonRpcV2Error {
 fn jsonrpc_code(e: &Error) -> JsonRpcV2Error {
     match e.kind() {
         ErrorKind::InvalidParams(_) => JsonRpcV2Error::InvalidParams,
-        ErrorKind::TooPopular => JsonRpcV2Error::BadRequest,
+        ErrorKind::TooPopular | ErrorKind::TooManyUtxos => JsonRpcV2Error::BadRequest,
         ErrorKind::RpcError(..) => JsonRpcV2Error::DaemonError,
         _ => JsonRpcV2Error::InternalError,
     }

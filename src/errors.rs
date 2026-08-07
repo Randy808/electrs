@@ -24,6 +24,11 @@ error_chain! {
             display("Too many history entries")
         }
 
+        TooManyUtxos {
+            description("Too many unspent outputs")
+            display("Too many unspent outputs")
+        }
+
         InvalidParams(msg: String) {
             description("Invalid RPC params")
             display("{}", msg)
