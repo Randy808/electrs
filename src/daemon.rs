@@ -49,6 +49,7 @@ lazy_static! {
 
 const MAX_ATTEMPTS: u32 = 5;
 const RETRY_WAIT_DURATION: Duration = Duration::from_secs(1);
+const BLOCK_TEMPLATE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[trace]
 fn parse_hash<T>(value: &Value) -> Result<T>
@@ -220,6 +221,44 @@ impl SubmitPackageResult {
 
 pub trait CookieGetter: Send + Sync {
     fn get(&self) -> Result<Vec<u8>>;
+}
+
+#[derive(Clone)]
+struct ConnectionConfig {
+    addr: SocketAddr,
+    fallback: Option<SocketAddr>,
+    cookie_getter: Arc<dyn CookieGetter>,
+    signal: Waiter,
+    max_age: Option<Duration>,
+}
+
+impl ConnectionConfig {
+    fn connect(&self) -> Result<Connection> {
+        Connection::new(
+            self.addr,
+            self.fallback,
+            Arc::clone(&self.cookie_getter),
+            self.signal.clone(),
+            self.max_age,
+        )
+    }
+
+    fn connect_once(&self, io_timeout: Duration) -> Result<Connection> {
+        let (conn, active_addr) = tcp_connect_once(self.addr, self.fallback)?;
+        conn.set_read_timeout(Some(io_timeout))
+            .chain_err(|| "failed to configure one-shot daemon read timeout")?;
+        conn.set_write_timeout(Some(io_timeout))
+            .chain_err(|| "failed to configure one-shot daemon write timeout")?;
+        Connection::from_stream(
+            conn,
+            active_addr,
+            self.addr,
+            self.fallback,
+            Arc::clone(&self.cookie_getter),
+            self.signal.clone(),
+            None, // a one-shot connection never needs proactive recycling
+        )
+    }
 }
 
 struct Connection {
@@ -516,10 +555,10 @@ pub struct Daemon {
     daemon_dir: PathBuf,
     blocks_dir: PathBuf,
     network: Network,
+    connection_config: ConnectionConfig,
     conn: Mutex<Connection>,
     message_id: Counter, // for monotonic JSONRPC 'id'
     signal: Waiter,
-    conn_max_age: Option<Duration>,
 
     rpc_threads: Arc<rayon::ThreadPool>,
 
@@ -542,20 +581,22 @@ impl Daemon {
         metrics: &Metrics,
         conn_max_age: Option<Duration>,
     ) -> Result<Daemon> {
+        let connection_config = ConnectionConfig {
+            addr: daemon_rpc_addr,
+            fallback: daemon_rpc_fallback_addr,
+            cookie_getter,
+            signal: signal.clone(),
+            max_age: conn_max_age,
+        };
+        let conn = connection_config.connect()?;
         let daemon = Daemon {
             daemon_dir: daemon_dir.clone(),
             blocks_dir: blocks_dir.clone(),
             network,
-            conn: Mutex::new(Connection::new(
-                daemon_rpc_addr,
-                daemon_rpc_fallback_addr,
-                cookie_getter,
-                signal.clone(),
-                conn_max_age,
-            )?),
+            connection_config,
+            conn: Mutex::new(conn),
             message_id: Counter::new(),
             signal: signal.clone(),
-            conn_max_age,
             rpc_threads: Arc::new(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(daemon_parallelism)
@@ -616,10 +657,10 @@ impl Daemon {
             daemon_dir: self.daemon_dir.clone(),
             blocks_dir: self.blocks_dir.clone(),
             network: self.network,
+            connection_config: self.connection_config.clone(),
             conn: Mutex::new(self.conn.lock().unwrap().reconnect()?),
             message_id: Counter::new(),
             signal: self.signal.clone(),
-            conn_max_age: self.conn_max_age,
             rpc_threads: self.rpc_threads.clone(),
             latency: self.latency.clone(),
             size: self.size.clone(),
@@ -664,8 +705,12 @@ impl Daemon {
     }
 
     #[trace]
-    fn call_jsonrpc(&self, method: &str, request: &Value) -> Result<Value> {
-        let mut conn = self.conn.lock().unwrap();
+    fn call_jsonrpc_on_connection(
+        &self,
+        method: &str,
+        request: &Value,
+        conn: &mut Connection,
+    ) -> Result<Value> {
         // Proactively recycle connections older than the configured max age. Re-establishing
         // the TCP connection lets a fronting load balancer (e.g. a Kubernetes ClusterSetIP)
         // re-select a backend, so a long-lived connection does not stay pinned to a stale
@@ -711,6 +756,12 @@ impl Daemon {
         Ok(result)
     }
 
+    #[trace]
+    fn call_jsonrpc(&self, method: &str, request: &Value) -> Result<Value> {
+        let mut conn = self.conn.lock().unwrap();
+        self.call_jsonrpc_on_connection(method, request, &mut conn)
+    }
+
     #[trace(method = %method)]
     fn handle_request(&self, method: &str, params: &Value) -> Result<Value> {
         let id = self.message_id.next();
@@ -746,9 +797,15 @@ impl Daemon {
         self.retry_request(method, &params)
     }
 
+    /// Perform one RPC on a fresh connection isolated from singleton RPC users.
+    /// Connection and warmup failures are returned to the caller without retrying.
     #[trace]
-    fn request_no_retry(&self, method: &str, params: Value) -> Result<Value> {
-        self.handle_request(method, &params)
+    fn request_once(&self, method: &str, params: Value, io_timeout: Duration) -> Result<Value> {
+        let id = self.message_id.next();
+        let req = json!({"method": method, "params": params, "id": id});
+        let mut conn = self.connection_config.connect_once(io_timeout)?;
+        let reply = self.call_jsonrpc_on_connection(method, &req, &mut conn)?;
+        parse_jsonrpc_reply(reply, method, id)
     }
 
     #[trace]
@@ -938,9 +995,24 @@ impl Daemon {
         Ok(serde_json::from_value(res).chain_err(|| "invalid getrawmempool reply")?)
     }
 
+    #[cfg(not(feature = "liquid"))]
     #[trace]
     pub fn getblocktemplate(&self, rules: &[&str]) -> Result<Value> {
-        self.request_no_retry("getblocktemplate", json!([{ "rules": rules }]))
+        self.request_once(
+            "getblocktemplate",
+            json!([{ "rules": rules }]),
+            BLOCK_TEMPLATE_RPC_TIMEOUT,
+        )
+    }
+
+    #[cfg(feature = "liquid")]
+    #[trace]
+    pub fn getnewblockhex(&self) -> Result<String> {
+        let value = self.request_once("getnewblockhex", json!([]), BLOCK_TEMPLATE_RPC_TIMEOUT)?;
+        value
+            .as_str()
+            .map(str::to_owned)
+            .chain_err(|| "non-string getnewblockhex response")
     }
 
     #[trace]
@@ -1093,9 +1165,12 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_jsonrpc_reply, recycle_due};
-    use crate::errors::{Error, ErrorKind};
+    use super::{parse_jsonrpc_reply, recycle_due, ConnectionConfig, CookieGetter};
+    use crate::errors::{Error, ErrorKind, Result};
+    use crate::signal::Waiter;
     use serde_json::json;
+    use std::net::TcpListener;
+    use std::sync::Arc;
     use std::time::Duration;
 
     const COOLDOWN: Duration = Duration::from_secs(30);
@@ -1103,6 +1178,30 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    struct StaticCookie;
+
+    impl CookieGetter for StaticCookie {
+        fn get(&self) -> Result<Vec<u8>> {
+            Ok(b"user:password".to_vec())
+        }
+    }
+
+    #[test]
+    fn one_shot_connection_uses_endpoint_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = ConnectionConfig {
+            addr: listener.local_addr().unwrap(),
+            fallback: None,
+            cookie_getter: Arc::new(StaticCookie),
+            signal: Waiter::start(crossbeam_channel::never()),
+            max_age: None,
+        };
+
+        let connection = config.connect_once(secs(2)).unwrap();
+        assert_eq!(connection.tx.read_timeout().unwrap(), Some(secs(2)));
+        assert_eq!(connection.tx.write_timeout().unwrap(), Some(secs(2)));
     }
 
     #[test]

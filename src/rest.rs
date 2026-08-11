@@ -533,7 +533,7 @@ fn spawn_conn(
 
             let resp_result = match body_result {
                 Ok(Ok(collected)) => {
-                    handle_request(method, uri, collected.to_bytes(), &query, &config)
+                    handle_request(method, uri, collected.to_bytes(), &query, &config).await
                 }
                 // Inner Err by http_body_util::Limited, either a LengthLimitError or an error by the underlying body stream
                 Ok(Err(e)) if e.is::<LengthLimitError>() => Err(HttpError(
@@ -672,7 +672,7 @@ impl Handle {
 }
 
 #[trace]
-fn handle_request(
+async fn handle_request(
     method: Method,
     uri: hyper::Uri,
     body: Bytes,
@@ -1156,7 +1156,7 @@ fn handle_request(
                     "mining REST endpoints are disabled".to_string(),
                 ));
             }
-            getblocktemplate_response(query.getblocktemplate())
+            getblocktemplate_response(query.getblocktemplate().await)
         }
 
         #[cfg(feature = "liquid")]
@@ -1366,14 +1366,16 @@ fn getblocktemplate_response(
             if let errors::ErrorKind::Connection(message) = err.kind() {
                 return text_response_no_store(StatusCode::BAD_GATEWAY, message.clone());
             }
-            Err(HttpError::from(err))
+            text_response_no_store(StatusCode::BAD_GATEWAY, err.to_string())
         }
     }
 }
 
 fn getblocktemplate_rpc_error(err: &errors::Error) -> Option<(i64, String)> {
     match err.kind() {
-        errors::ErrorKind::RpcError(code, message, method) if method == "getblocktemplate" => {
+        errors::ErrorKind::RpcError(code, message, method)
+            if method == "getblocktemplate" || method == "getnewblockhex" =>
+        {
             Some((*code, message.clone()))
         }
         _ => None,
@@ -1628,6 +1630,17 @@ mod tests {
             errors::ErrorKind::RpcError(-5, "Block not found".to_string(), "getblock".to_string())
                 .into();
         assert_eq!(super::getblocktemplate_rpc_error(&other_method), None);
+
+        let elements_err: errors::Error = errors::ErrorKind::RpcError(
+            -28,
+            "warming up".to_string(),
+            "getnewblockhex".to_string(),
+        )
+        .into();
+        assert_eq!(
+            super::getblocktemplate_rpc_error(&elements_err),
+            Some((-28, "warming up".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -1665,5 +1678,23 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"daemon unavailable");
+
+        for message in [
+            "invalid getnewblockhex block hex",
+            "daemon returned a stale or competing block template twice",
+        ] {
+            let error: errors::Error = message.into();
+            let response = super::getblocktemplate_response(Err(error)).unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], message.as_bytes());
+        }
     }
 }
