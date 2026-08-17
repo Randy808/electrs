@@ -107,7 +107,11 @@ fn jsonrpc_code(e: &Error) -> JsonRpcV2Error {
     match e.kind() {
         ErrorKind::InvalidParams(_) => JsonRpcV2Error::InvalidParams,
         ErrorKind::TooPopular | ErrorKind::TooManyUtxos => JsonRpcV2Error::BadRequest,
-        ErrorKind::RpcError(..) => JsonRpcV2Error::DaemonError,
+        // The daemon could not be reached (or we refused to queue for it) for a request
+        // made on the client's behalf. This is a downstream failure, not a client error.
+        ErrorKind::RpcError(..) | ErrorKind::DaemonBusy(_) | ErrorKind::DaemonUnavailable(_) => {
+            JsonRpcV2Error::DaemonError
+        }
         _ => JsonRpcV2Error::InternalError,
     }
 }
