@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Lines, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, io};
 
@@ -44,6 +44,24 @@ lazy_static! {
     // inability to open new connections doesn't make every request pay a connect timeout.
     static ref DAEMON_CONN_RECYCLE_COOLDOWN: Duration = Duration::from_secs(
         env::var("DAEMON_CONN_RECYCLE_COOLDOWN").map_or(30, |s| s.parse().unwrap())
+    );
+    // Maximum number of daemon RPCs made on behalf of API clients (transaction broadcast
+    // and package submission) that may be in flight at once. These endpoints are reachable
+    // anonymously, so this is what bounds how many threads a slow or wedged daemon can
+    // park. Kept well below bitcoind's own rpcthreads/rpcworkqueue so client traffic
+    // cannot starve the indexer of daemon capacity.
+    static ref DAEMON_PROXY_MAX_CONCURRENCY: usize =
+        env::var("DAEMON_PROXY_MAX_CONCURRENCY").map_or(8, |s| s.parse().unwrap());
+    // Read/write timeout for client-proxied RPCs. Deliberately far shorter than
+    // DAEMON_READ_TIMEOUT: an API client must get an answer (or a 504) in bounded time,
+    // whereas the indexer can afford to wait out a long-running daemon call.
+    static ref DAEMON_PROXY_RPC_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_PROXY_RPC_TIMEOUT").map_or(30, |s| s.parse().unwrap())
+    );
+    // How long a client-proxied RPC waits for a free slot before giving up with
+    // `DaemonBusy`, rather than queueing behind an unbounded backlog.
+    static ref DAEMON_PROXY_QUEUE_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_PROXY_QUEUE_TIMEOUT").map_or(5, |s| s.parse().unwrap())
     );
 }
 
@@ -533,6 +551,68 @@ impl Connection {
     }
 }
 
+/// A counting semaphore for blocking (non-async) callers, used to cap how many daemon RPCs
+/// may be in flight on behalf of API clients at any one time.
+///
+/// Client-triggered RPCs are anonymous and unmetered, so without a cap a caller can open as
+/// many concurrent daemon calls as it can open sockets. Each of those calls occupies a
+/// thread for as long as the daemon takes to answer, which is what turns a slow daemon into
+/// a full API outage. Bounding them means a slow daemon degrades the endpoints that need it
+/// and leaves every other endpoint untouched.
+struct BlockingSemaphore {
+    /// Number of permits still available.
+    available: Mutex<usize>,
+    released: Condvar,
+    capacity: usize,
+}
+
+impl BlockingSemaphore {
+    fn new(capacity: usize) -> Self {
+        // A zero capacity would deadlock every caller, so treat it as "one at a time".
+        let capacity = capacity.max(1);
+        BlockingSemaphore {
+            available: Mutex::new(capacity),
+            released: Condvar::new(),
+            capacity,
+        }
+    }
+
+    /// Take a permit, waiting at most `wait_timeout` for one to be released. Returns `None`
+    /// if none became available in time, so the caller can fail fast instead of queueing
+    /// behind an unbounded backlog of requests to an unresponsive daemon.
+    fn acquire(&self, wait_timeout: Duration) -> Option<SemaphorePermit<'_>> {
+        let deadline = Instant::now() + wait_timeout;
+        let mut available = self.available.lock().unwrap();
+        loop {
+            if *available > 0 {
+                *available -= 1;
+                return Some(SemaphorePermit { semaphore: self });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            available = self.released.wait_timeout(available, remaining).unwrap().0;
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Returns its permit to the [`BlockingSemaphore`] on drop.
+struct SemaphorePermit<'a> {
+    semaphore: &'a BlockingSemaphore,
+}
+
+impl Drop for SemaphorePermit<'_> {
+    fn drop(&mut self) {
+        *self.semaphore.available.lock().unwrap() += 1;
+        self.semaphore.released.notify_one();
+    }
+}
+
 struct Counter {
     value: Mutex<u64>,
 }
@@ -562,10 +642,15 @@ pub struct Daemon {
 
     rpc_threads: Arc<rayon::ThreadPool>,
 
+    // Caps concurrent RPCs issued on behalf of API clients (see `request_proxied`).
+    // Shared across reconnects so the cap stays global to the process.
+    proxy_limit: Arc<BlockingSemaphore>,
+
     // monitoring
     latency: HistogramVec,
     size: HistogramVec,
     conn_recycle: CounterVec,
+    proxy_rpc: CounterVec,
 }
 
 impl Daemon {
@@ -604,6 +689,7 @@ impl Daemon {
                     .build()
                     .unwrap(),
             ),
+            proxy_limit: Arc::new(BlockingSemaphore::new(*DAEMON_PROXY_MAX_CONCURRENCY)),
             latency: metrics.histogram_vec(
                 HistogramOpts::new("daemon_rpc", "Bitcoind RPC latency (in seconds)"),
                 &["method"],
@@ -611,6 +697,13 @@ impl Daemon {
             size: metrics.histogram_vec(
                 HistogramOpts::new("daemon_bytes", "Bitcoind RPC size (in bytes)"),
                 &["method", "dir"],
+            ),
+            proxy_rpc: metrics.counter_vec(
+                MetricOpts::new(
+                    "daemon_rpc_proxied",
+                    "Daemon RPCs made on behalf of API clients (by result)",
+                ),
+                &["result"],
             ),
             conn_recycle: metrics.counter_vec(
                 MetricOpts::new(
@@ -662,9 +755,11 @@ impl Daemon {
             message_id: Counter::new(),
             signal: self.signal.clone(),
             rpc_threads: self.rpc_threads.clone(),
+            proxy_limit: Arc::clone(&self.proxy_limit),
             latency: self.latency.clone(),
             size: self.size.clone(),
             conn_recycle: self.conn_recycle.clone(),
+            proxy_rpc: self.proxy_rpc.clone(),
         })
     }
 
@@ -806,6 +901,60 @@ impl Daemon {
         let mut conn = self.connection_config.connect_once(io_timeout)?;
         let reply = self.call_jsonrpc_on_connection(method, &req, &mut conn)?;
         parse_jsonrpc_reply(reply, method, id)
+    }
+
+    /// Perform one RPC on behalf of an API client, bounded in both concurrency and time.
+    ///
+    /// The REST and Electrum endpoints that reach the daemon are anonymous and unmetered,
+    /// so they must not use `request`: that path serializes on the process-wide
+    /// `Mutex<Connection>` (letting one slow client request stall the indexer and every
+    /// other client) and retries transport failures forever (letting one client request
+    /// occupy a thread indefinitely). Instead each call gets its own short-lived
+    /// connection with a short I/O timeout, and `proxy_limit` caps how many may be in
+    /// flight at once. Failures are reported to the client rather than retried.
+    #[trace(method = %method)]
+    fn request_proxied(&self, method: &str, params: Value) -> Result<Value> {
+        let _permit = self
+            .proxy_limit
+            .acquire(*DAEMON_PROXY_QUEUE_TIMEOUT)
+            .ok_or_else(|| {
+                self.proxy_rpc.with_label_values(&["busy"]).inc();
+                Error::from(ErrorKind::DaemonBusy(format!(
+                    "all {} client RPC slots are in use, gave up waiting after {:?}",
+                    self.proxy_limit.capacity(),
+                    *DAEMON_PROXY_QUEUE_TIMEOUT
+                )))
+            })?;
+
+        match self.request_once(method, params, *DAEMON_PROXY_RPC_TIMEOUT) {
+            Ok(result) => {
+                self.proxy_rpc.with_label_values(&["ok"]).inc();
+                Ok(result)
+            }
+            Err(err) => {
+                // Report transport-level failures (which include hitting
+                // DAEMON_PROXY_RPC_TIMEOUT) distinctly from daemon-level rejections, so
+                // callers can answer "the daemon didn't respond" with a gateway error
+                // instead of blaming the client's request.
+                let unavailable = match err.kind() {
+                    ErrorKind::Connection(msg) => Some(format!("{} failed: {}", method, msg)),
+                    _ => None,
+                };
+                match unavailable {
+                    Some(msg) => {
+                        // The concise message is what the client sees, so log the full
+                        // chain (which carries the underlying io error) before dropping it.
+                        warn!("client daemon RPC failed: {}", err.display_chain());
+                        self.proxy_rpc.with_label_values(&["unavailable"]).inc();
+                        Err(ErrorKind::DaemonUnavailable(msg).into())
+                    }
+                    None => {
+                        self.proxy_rpc.with_label_values(&["error"]).inc();
+                        Err(err)
+                    }
+                }
+            }
+        }
     }
 
     #[trace]
@@ -1020,9 +1169,14 @@ impl Daemon {
         self.broadcast_raw(&serialize_hex(tx))
     }
 
+    /// Broadcast a raw transaction on behalf of an API client.
+    ///
+    /// Uses the bounded client RPC path (`request_proxied`) rather than the shared
+    /// singleton connection: this is reachable anonymously over both the REST and Electrum
+    /// interfaces, so it must not be able to stall the indexer or other clients.
     #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
-        let txid = self.request("sendrawtransaction", json!([txhex]))?;
+        let txid = self.request_proxied("sendrawtransaction", json!([txhex]))?;
         Ok(
             Txid::from_str(txid.as_str().chain_err(|| "non-string txid")?)
                 .chain_err(|| "failed to parse txid")?,
@@ -1043,7 +1197,8 @@ impl Daemon {
             (None, Some(burn)) => json!([txhex, null, format!("{:.8}", burn)]),
             (None, None) => json!([txhex]),
         };
-        let result = self.request("submitpackage", params)?;
+        // Anonymously reachable, so bounded like broadcast_raw() above.
+        let result = self.request_proxied("submitpackage", params)?;
         serde_json::from_value::<SubmitPackageResult>(result)
             .chain_err(|| "invalid submitpackage reply")
     }
@@ -1165,13 +1320,16 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_jsonrpc_reply, recycle_due, ConnectionConfig, CookieGetter};
+    use super::{
+        parse_jsonrpc_reply, recycle_due, BlockingSemaphore, ConnectionConfig, CookieGetter,
+    };
     use crate::errors::{Error, ErrorKind, Result};
     use crate::signal::Waiter;
     use serde_json::json;
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const COOLDOWN: Duration = Duration::from_secs(30);
     const MAX_AGE: Option<Duration> = Some(Duration::from_secs(60));
@@ -1230,6 +1388,107 @@ mod tests {
     #[test]
     fn expired_after_cooldown_retries() {
         assert!(recycle_due(secs(600), MAX_AGE, Some(secs(31)), COOLDOWN));
+    }
+
+    #[test]
+    fn one_shot_connection_recv_gives_up_at_the_endpoint_timeout() {
+        // A daemon that accepts the connection and then never answers is exactly the
+        // failure mode behind XF-05: without a short client-facing timeout the caller
+        // blocks for DAEMON_READ_TIMEOUT (10 minutes by default). Hold the accepted socket
+        // open for the duration so the read blocks rather than seeing EOF.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let blackhole = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            thread::sleep(secs(5));
+            drop(socket);
+        });
+
+        let config = ConnectionConfig {
+            addr,
+            fallback: None,
+            cookie_getter: Arc::new(StaticCookie),
+            signal: Waiter::start(crossbeam_channel::never()),
+            max_age: None,
+        };
+
+        let mut connection = config.connect_once(secs(1)).unwrap();
+        connection
+            .send(&json!({"method": "getblockcount"}).to_string())
+            .unwrap();
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::Connection(_)),
+            "expected a connection error, got {:?}",
+            err
+        );
+        assert!(
+            elapsed >= secs(1) && elapsed < secs(4),
+            "recv should give up at the endpoint timeout, took {:?}",
+            elapsed
+        );
+
+        blackhole.join().unwrap();
+    }
+
+    #[test]
+    fn semaphore_hands_out_capacity_permits() {
+        let semaphore = BlockingSemaphore::new(2);
+        let first = semaphore.acquire(secs(0));
+        let second = semaphore.acquire(secs(0));
+        assert!(first.is_some());
+        assert!(second.is_some());
+        // At capacity: the third caller is refused rather than queued indefinitely.
+        assert!(semaphore.acquire(secs(0)).is_none());
+    }
+
+    #[test]
+    fn semaphore_permit_is_returned_on_drop() {
+        let semaphore = BlockingSemaphore::new(1);
+        {
+            let _permit = semaphore.acquire(secs(0)).unwrap();
+            assert!(semaphore.acquire(secs(0)).is_none());
+        }
+        assert!(semaphore.acquire(secs(0)).is_some());
+    }
+
+    #[test]
+    fn semaphore_zero_capacity_is_treated_as_one() {
+        // A zero cap would wedge every client request, so it is clamped rather than honored.
+        let semaphore = BlockingSemaphore::new(0);
+        assert_eq!(semaphore.capacity(), 1);
+        assert!(semaphore.acquire(secs(0)).is_some());
+    }
+
+    #[test]
+    fn semaphore_gives_up_after_wait_timeout() {
+        let semaphore = BlockingSemaphore::new(1);
+        let _permit = semaphore.acquire(secs(0)).unwrap();
+
+        // This is what stops client requests from piling up behind a wedged daemon: the
+        // caller waits a bounded time and is then refused.
+        let started = Instant::now();
+        assert!(semaphore.acquire(Duration::from_millis(150)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn semaphore_wakes_a_waiter_when_a_permit_is_released() {
+        let semaphore = Arc::new(BlockingSemaphore::new(1));
+        let permit = semaphore.acquire(secs(0)).unwrap();
+
+        let waiter = {
+            let semaphore = Arc::clone(&semaphore);
+            thread::spawn(move || semaphore.acquire(secs(5)).is_some())
+        };
+
+        thread::sleep(Duration::from_millis(50));
+        drop(permit);
+        assert!(waiter.join().unwrap());
     }
 
     #[test]

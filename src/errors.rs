@@ -34,6 +34,22 @@ error_chain! {
             display("{}", msg)
         }
 
+        // Raised when a request made on behalf of an API client cannot get one of the
+        // bounded client RPC slots within its wait budget. The daemon itself may be
+        // perfectly healthy - we are simply refusing to queue any deeper.
+        DaemonBusy(msg: String) {
+            description("Daemon RPC concurrency limit reached")
+            display("Daemon is busy: {}", msg)
+        }
+
+        // Raised when a request made on behalf of an API client fails at the transport
+        // level (connect failure, or a read that exceeded the client-facing timeout).
+        // Unlike internal callers, client requests are not retried indefinitely.
+        DaemonUnavailable(msg: String) {
+            description("Daemon RPC unavailable")
+            display("Daemon is unavailable: {}", msg)
+        }
+
         #[cfg(feature = "electrum-discovery")]
         ElectrumClient(e: electrum_client::Error) {
             description("Electrum client error")
