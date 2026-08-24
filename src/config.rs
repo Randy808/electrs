@@ -1,5 +1,6 @@
 use clap::{App, Arg};
 use dirs::home_dir;
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
@@ -17,6 +18,33 @@ use bitcoin::Network as BNetwork;
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone)]
+pub struct SensitiveAuth(String);
+
+impl SensitiveAuth {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SensitiveAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let username = self
+            .0
+            .split_once(':')
+            .map(|(username, _)| username)
+            .unwrap_or("<invalid>");
+        f.debug_tuple("UserPass")
+            .field(&username)
+            .field(&"<sensitive>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // See below for the documentation of each field:
@@ -29,7 +57,7 @@ pub struct Config {
     pub daemon_rpc_fallback_addr: Option<SocketAddr>,
     pub daemon_parallelism: usize,
     pub daemon_conn_max_age: Option<Duration>,
-    pub cookie: Option<String>,
+    pub cookie: Option<SensitiveAuth>,
     pub electrum_rpc_addr: SocketAddr,
     pub electrum_rpc_conn_max_age: Option<Duration>,
     pub http_addr: SocketAddr,
@@ -496,7 +524,9 @@ impl Config {
             .value_of("blocks_dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| daemon_dir.join("blocks"));
-        let cookie = m.value_of("cookie").map(|s| s.to_owned());
+        let cookie = m
+            .value_of("cookie")
+            .map(|s| SensitiveAuth::new(s.to_owned()));
 
         let electrum_banner = m.value_of("electrum_banner").map_or_else(
             || format!("Welcome to electrs-esplora {}", ELECTRS_VERSION),
@@ -573,7 +603,14 @@ impl Config {
             #[cfg(feature = "electrum-discovery")]
             tor_proxy: m.value_of("tor_proxy").map(|s| s.parse().unwrap()),
         };
-        eprintln!("{:?}", config);
+        match &config.cookie {
+            Some(auth) => log::debug!("daemon authentication: {:?}", auth),
+            None => log::debug!(
+                "daemon authentication: CookieFile({:?})",
+                config.daemon_dir.join(".cookie")
+            ),
+        }
+        log::debug!("configuration: {:?}", config);
         config
     }
 
@@ -648,5 +685,20 @@ impl CookieGetter for CookieFile {
             ErrorKind::Connection(format!("failed to read cookie from {:?}", path))
         })?;
         Ok(contents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SensitiveAuth;
+
+    #[test]
+    fn sensitive_auth_debug_redacts_password() {
+        let password = "poc-PASSWORD-123";
+        let auth = SensitiveAuth::new(format!("poc-user:{}", password));
+        let rendered = format!("{:?}", auth);
+
+        assert_eq!(rendered, r#"UserPass("poc-user", "<sensitive>")"#);
+        assert!(!rendered.contains(password));
     }
 }
